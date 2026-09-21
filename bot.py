@@ -138,6 +138,14 @@ def esc(value: object) -> str:
     return html.escape(str(value))
 
 
+def fmt_phone(phone: str) -> str:
+    """+91 plain, local part in monospace so it copies clean: +91<code>8521154722</code>."""
+    digits = phone.lstrip("+")
+    if NUMBER_PREFIX and digits.startswith(NUMBER_PREFIX):
+        return f"+{NUMBER_PREFIX}<code>{esc(digits[len(NUMBER_PREFIX):])}</code>"
+    return f"<code>{esc(digits)}</code>"
+
+
 def fmt_left(seconds: int) -> str:
     return f"{seconds // 60}m {seconds % 60:02d}s"
 
@@ -196,7 +204,7 @@ def render(act: Activation) -> str:
     }.get(act.state, act.state.upper())
 
     lines = [
-        f"<b>{esc(act.phone)}</b>",
+        f"<b>{fmt_phone(act.phone)}</b>",
         f"service <code>{esc(act.service)}</code> · country <code>{esc(act.country)}</code>",
         f"id <code>{esc(act.act_id)}</code> · {label}",
     ]
@@ -613,7 +621,7 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for act in rows:
         codes = ", ".join(act.codes) if act.codes else "—"
         lines.append(
-            f"<code>{esc(act.phone)}</code> · {esc(act.service)} · "
+            f"{fmt_phone(act.phone)} · {esc(act.service)} · "
             f"{esc(act.state)} · {esc(codes)}"
         )
     await update.effective_message.reply_text(
@@ -1015,7 +1023,7 @@ async def cancel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             else f"cancel failed: {result}")
     await notify(
         context, act.chat_id,
-        f"<code>{esc(act.act_id)}</code> ({esc(act.phone)}): {esc(text)}",
+        f"<code>{esc(act.act_id)}</code> ({fmt_phone(act.phone)}): {esc(text)}",
     )
 
 
@@ -1160,7 +1168,7 @@ async def poll_activations(context: ContextTypes.DEFAULT_TYPE) -> None:
             await notify(
                 context, act.chat_id,
                 f"Activation <code>{esc(act.act_id)}</code> "
-                f"({esc(act.phone)}) closed: {esc(act.note)}",
+                f"({fmt_phone(act.phone)}) closed: {esc(act.note)}",
             )
             continue
 
@@ -1195,7 +1203,7 @@ async def poll_activations(context: ContextTypes.DEFAULT_TYPE) -> None:
             index = len(act.codes)
             await notify(
                 context, act.chat_id,
-                f"<b>Code {index}</b> for {esc(act.phone)}: "
+                f"<b>Code {index}</b> for {fmt_phone(act.phone)}: "
                 f"<code>{esc(status.code)}</code>",
             )
             continue
