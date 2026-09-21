@@ -952,6 +952,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # cancel
 # --------------------------------------------------------------------------
 
+# Live 2026-09-21: TemporaSMS answers a too-early cancel with a bare ERROR.
 _EARLY_CANCEL = ("EARLY_CANCEL_DENIED", "BAD_STATUS", "ERROR")
 
 
@@ -977,7 +978,7 @@ async def try_cancel(
         wait = CANCEL_AFTER - elapsed
         if exc.code in _EARLY_CANCEL and (wait > 0 or attempt < CANCEL_RETRIES):
             delay = wait + 2 if wait > 0 else CANCEL_RETRY_EVERY
-            act.note = f"cancel queued — retrying in {int(delay)}s ({exc.code})"
+            act.note = f"cancel queued — provider says too early, retrying in {int(delay)}s"
             store.update(act)
             await refresh_card(context, act)
             context.job_queue.run_once(
