@@ -32,7 +32,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Conflict
+from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -229,6 +229,9 @@ async def refresh_card(context: ContextTypes.DEFAULT_TYPE, act: Activation) -> N
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             log.warning("edit failed for %s: %s", act.act_id, exc)
+    except RetryAfter as exc:
+        # Telegram flood control on rapid edits - skip this tick, resume later.
+        log.warning("edit throttled for %s: retry in %ss", act.act_id, exc.retry_after)
 
 
 async def notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
@@ -1152,6 +1155,10 @@ async def poll_activations(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"<b>Code {index}</b> for {esc(act.phone)}: "
                 f"<code>{esc(status.code)}</code>",
             )
+            continue
+
+        # Nothing changed - still redraw so the countdown ticks every cycle.
+        await refresh_card(context, act)
 
 
 async def on_startup(app: Application) -> None:
