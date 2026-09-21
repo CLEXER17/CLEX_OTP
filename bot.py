@@ -347,6 +347,7 @@ async def do_buy(
     candidates = [operator] if isinstance(operator, str) else list(operator or [])
     if not candidates:
         candidates = [current_operator]
+    candidates = list(dict.fromkeys(candidates))  # dedupe, keep order
     async with buy_lock:
         live = store.live()
         if len(live) >= MAX_LIVE:
@@ -381,7 +382,9 @@ async def do_buy(
             detail = "\n".join(failures) if len(failures) > 1 else str(
                 TemporaError(last)
             )
-            await status_msg.edit_text(f"Could not buy a number.\n{detail}{hint}")
+            names = await service_names()
+            label = f"{service} ({names[service]})" if service in names else service
+            await status_msg.edit_text(f"Could not buy {label}.\n{detail}{hint}")
             return
         if len(candidates) > 1:
             log.info("bought %s on %s after %s", service, op_label(operator), failures or "no failures")
