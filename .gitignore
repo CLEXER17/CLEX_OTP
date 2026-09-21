@@ -1,0 +1,24 @@
+# secrets — never commit
+.env
+*.env
+!.env.example
+
+# local state
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
