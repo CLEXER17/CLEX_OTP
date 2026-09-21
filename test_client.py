@@ -11,7 +11,7 @@ import tempfile
 import time
 
 from store import CANCELLED, LIVE, Activation, Store
-from tempora import parse_v3_providers, API_ERRORS, TemporaError, TemporaSMS
+from tempora import parse_v3_country, parse_v3_providers, API_ERRORS, TemporaError, TemporaSMS
 
 PASS, FAIL = 0, 0
 
@@ -194,6 +194,11 @@ def test_parse_v3() -> None:
           parse_v3_providers({"22": {"wa": {}}}, "22", "wa"), {})
     check("not a dict -> None", parse_v3_providers("BAD", "22", "wa"), None)
     check("int country accepted", parse_v3_providers(doc, 22, "wa") is not None, True)
+    full = {"22": {"wa": doc["22"]["wa"], "tg": {"count": 0, "providers": {}},
+                   "fb": {"providers": {"1": {"count": 5, "price": [1]}}}}}
+    check("country-wide", parse_v3_country(full, "22"),
+          {"wa": {"3": (467, [2.99]), "7": (12, [2.5, 3.5])}, "fb": {"1": (5, [1.0])}})
+    check("country-wide, missing country", parse_v3_country(full, "1"), None)
 
 
 def test_dedup_logic() -> None:

@@ -36,7 +36,7 @@ multi-user path in this build.
 /recent                           last 15
 /balance                          wallet balance
 /price SERVICE
-/stock SERVICE                    sweep all operators, rank by available stock
+/stock [NAME|CODE]                live stock per operator; no arg = every service
 /op [N|smart|auto|cheap|best]     show or switch the active operator
 /operators                        list upstream operator ids
 /countries

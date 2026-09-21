@@ -38,7 +38,7 @@ from telegram.ext import (
 )
 
 from store import CANCELLED, DONE, EXPIRED, LIVE, Activation, Store
-from tempora import TemporaError, TemporaSMS, parse_v3_providers
+from tempora import TemporaError, TemporaSMS, parse_v3_country
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
@@ -225,7 +225,8 @@ HELP = """<b>TemporaSMS bot</b>
 <code>/recent</code>   last 15 activations
 <code>/balance</code>  wallet balance
 <code>/price SERVICE{country_arg}</code>
-<code>/stock SERVICE{country_arg}</code>  stock per operator, best first
+<code>/stock</code>  every service with stock, per operator
+<code>/stock whatsapp</code>  one app, by name or code
 <code>/op [N]</code> · <code>/operators</code> · <code>/countries</code> · <code>/services</code>
 <code>/stats</code>    local counters
 
@@ -437,76 +438,127 @@ async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+_services_cache: dict[str, str] = {}
+
+
+async def service_names() -> dict[str, str]:
+    """code -> display name, fetched once per process."""
+    if not _services_cache:
+        try:
+            data = await api.get_services(operator=list_operator())
+            if isinstance(data, dict):
+                _services_cache.update({str(k): str(v) for k, v in data.items()})
+        except TemporaError as exc:
+            log.warning("getServices failed: %s", exc)
+    return _services_cache
+
+
+async def sweep_stock(country: str) -> tuple[dict[str, dict], list[str]]:
+    """getPricesV3 for every operator, merged: {service: {provider: (count, prices)}}."""
+    ops = await api.get_operators()
+    values = ops.values() if isinstance(ops, dict) else ops
+    op_ids = sorted({str(v) for v in values if str(v).isdigit()}, key=int)
+
+    merged: dict[str, dict] = {}
+    errors: list[str] = []
+    for op in op_ids:
+        try:
+            data = await api.get_prices_v3(country, operator=op)
+        except TemporaError as exc:
+            errors.append(f"{op}: {exc.code}")
+            if exc.code == "TOO_MANY_REQUESTS":
+                break
+            continue
+        parsed = parse_v3_country(data, country)
+        if parsed is None:
+            errors.append(f"{op}: unexpected shape {str(data)[:80]!r}")
+            continue
+        for service, providers in parsed.items():
+            slot = merged.setdefault(service, {})
+            for pid, (count, prices) in providers.items():
+                if pid not in slot or count > slot[pid][0]:
+                    slot[pid] = (count, prices)
+    return merged, errors
+
+
+def fmt_providers(providers: dict) -> str:
+    parts = []
+    for pid, (count, prices) in sorted(providers.items(), key=lambda kv: -kv[1][0]):
+        if not count:
+            continue
+        price = f"@{prices[0]:g}" if prices else ""
+        parts.append(f"op{pid} {count}{price}")
+    return ", ".join(parts) or "—"
+
+
 @admin_only
 async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stock per operator for one service/country, best first.
+    """Live stock per operator for India.
 
-    getPricesV3 with a numeric operator reports that operator's providers.
-    Sweeping every id from /operators and merging by provider id gives the
-    full picture whatever each call chooses to include.
+    /stock            every service with stock, biggest first
+    /stock wa         one service by code
+    /stock whatsapp   services whose name contains the text
     """
     msg = update.effective_message
     args = context.args or []
-    if not args:
-        await msg.reply_text(f"Usage: /stock SERVICE{COUNTRY_ARG}\nExample: /stock wa")
-        return
-    service = args[0]
-    country, _ = split_country(args)
+    country, rest = split_country(args) if args else (DEFAULT_COUNTRY, [])
+    query = args[0].lower() if args else ""
 
+    status = await msg.reply_text("Sweeping operators…")
     try:
-        ops = await api.get_operators()
+        merged, errors = await sweep_stock(country)
     except TemporaError as exc:
-        await msg.reply_text(f"Error listing operators: {exc}")
+        await status.edit_text(f"Error: {exc}")
         return
-    values = ops.values() if isinstance(ops, dict) else ops
-    op_ids = sorted({str(v) for v in values if str(v).isdigit()}, key=int)
-    if not op_ids:
-        await msg.reply_text("No operators returned.")
-        return
+    names = await service_names()
 
-    status = await msg.reply_text(f"Checking {len(op_ids)} operators…")
-    merged: dict[str, tuple[int, list[float]]] = {}
-    errors: list[str] = []
-    unparsed: str | None = None
-    for op in op_ids:
-        try:
-            data = await api.get_prices_v3(country, service=service, operator=op)
-        except TemporaError as exc:
-            if exc.code == "TOO_MANY_REQUESTS":
-                errors.append(f"{op}: rate limited, stopped")
-                break
-            errors.append(f"{op}: {exc.code}")
-            continue
-        found = parse_v3_providers(data, country, service)
-        if found is None:
-            if unparsed is None:
-                unparsed = str(data)[:300]
-            continue
-        for pid, (count, prices) in found.items():
-            prev = merged.get(pid)
-            if prev is None or count > prev[0]:
-                merged[pid] = (count, prices)
-        merged.setdefault(op, (0, []))
-
-    def order(item):
-        pid, (count, prices) = item
-        return (-count, prices[0] if prices else 1e9, int(pid) if pid.isdigit() else 0)
-
-    lines = [f"<b>{esc(service)} · country {esc(country)}</b>", ""]
-    for pid, (count, prices) in sorted(merged.items(), key=order):
-        if count:
-            price = " @ " + " / ".join(f"{p:g}" for p in prices) if prices else ""
-            lines.append(f"op <b>{esc(pid)}</b>: {count}{esc(price)}")
+    if query:
+        if query in merged or query in names:
+            picked = {query: merged.get(query, {})}
         else:
-            lines.append(f"op {esc(pid)}: —")
-    total = sum(c for c, _ in merged.values())
-    lines += ["", f"total <b>{total}</b> · current operator: {esc(current_operator)}"]
+            picked = {
+                code: prov for code, prov in merged.items()
+                if query in names.get(code, "").lower()
+            }
+            if not picked:
+                hits = [c for c, n in names.items() if query in n.lower()]
+                if hits:
+                    await status.edit_text(
+                        f"No stock right now for: " +
+                        ", ".join(f"{c} ({names[c]})" for c in hits[:10])
+                    )
+                else:
+                    await status.edit_text(f"No service matches '{query}'. Try /services {query}")
+                return
+        title = f"stock for '{esc(query)}'"
+    else:
+        picked = merged
+        title = "all services with stock"
+
+    ranked = sorted(
+        picked.items(),
+        key=lambda kv: -sum(c for c, _ in kv[1].values()),
+    )
+    lines = [f"<b>India · {title}</b>", ""]
+    shown = 0
+    for code, providers in ranked:
+        total = sum(c for c, _ in providers.values())
+        if not total and not query:
+            continue
+        name = names.get(code, "")
+        label = f"<code>{esc(code)}</code> {esc(name)}".strip()
+        lines.append(f"{label}: <b>{total}</b>  ({esc(fmt_providers(providers))})")
+        shown += 1
+        if shown >= 40:
+            lines.append(f"… {len(ranked) - shown} more; narrow with /stock NAME")
+            break
+    if shown == 0:
+        lines.append("nothing in stock")
     if errors:
         lines += ["", "<i>" + esc("; ".join(errors)) + "</i>"]
-    if unparsed:
-        lines += ["", "<i>unexpected shape:</i>", f"<pre>{esc(unparsed)}</pre>"]
-    lines += ["", f"buy from one: <code>/op N</code> then <code>/buy {esc(service)}</code>"]
-    await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    lines += ["", "buy: <code>/op N</code> then <code>/buy CODE</code>"]
+    text = "\n".join(lines)
+    await status.edit_text(text[:4000], parse_mode=ParseMode.HTML)
 
 
 @admin_only

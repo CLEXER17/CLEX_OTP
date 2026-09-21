@@ -294,29 +294,19 @@ def _num(value: Any) -> float | None:
         return None
 
 
-def parse_v3_providers(
-    data: Any, country: str | int, service: str
-) -> dict[str, tuple[int, list[float]]] | None:
-    """getPricesV3 -> {provider_id: (count, sorted prices)} for one service.
+Providers = dict[str, tuple[int, list[float]]]
 
-    Returns {} when the country is present but the service has no providers,
-    and None when the payload is not the documented shape.
-    """
-    if not isinstance(data, dict):
-        return None
-    node = data.get(str(country))
+
+def _parse_providers(node: Any) -> Providers | None:
+    """One service node -> {provider_id: (count, sorted prices)}."""
     if not isinstance(node, dict):
         return None
-    node = node.get(service)
-    if not isinstance(node, dict):
-        return {}
     providers = node.get("providers")
     if providers is None:
         return {}
     if not isinstance(providers, dict):
         return None
-
-    out: dict[str, tuple[int, list[float]]] = {}
+    out: Providers = {}
     for pid, info in providers.items():
         if not isinstance(info, dict):
             continue
@@ -327,3 +317,41 @@ def parse_v3_providers(
         prices = sorted(p for p in (_num(x) for x in raw_prices) if p is not None)
         out[str(pid)] = (int(count or 0), prices)
     return out
+
+
+def parse_v3_country(data: Any, country: str | int) -> dict[str, Providers] | None:
+    """getPricesV3 (no service filter) -> {service: {provider: (count, prices)}}.
+
+    Services without a usable providers map are skipped. None when the
+    payload is not the documented shape.
+    """
+    if not isinstance(data, dict):
+        return None
+    node = data.get(str(country))
+    if not isinstance(node, dict):
+        return None
+    out: dict[str, Providers] = {}
+    for service, svc_node in node.items():
+        providers = _parse_providers(svc_node)
+        if providers:
+            out[str(service)] = providers
+    return out
+
+
+def parse_v3_providers(
+    data: Any, country: str | int, service: str
+) -> Providers | None:
+    """getPricesV3 -> {provider_id: (count, sorted prices)} for one service.
+
+    Returns {} when the country is present but the service has no providers,
+    and None when the payload is not the documented shape.
+    """
+    if not isinstance(data, dict):
+        return None
+    node = data.get(str(country))
+    if not isinstance(node, dict):
+        return None
+    svc = node.get(service)
+    if svc is None:
+        return {}
+    return _parse_providers(svc)
