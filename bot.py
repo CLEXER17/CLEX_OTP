@@ -666,12 +666,19 @@ async def live_max_price(service: str, country: str, operator: str) -> int | Non
     Multi-price operators refuse getNumber without maxPrice (WRONG_MAX_PRICE);
     the cap is the largest live option so any of them can be reserved.
     """
-    try:
-        data = await api.get_prices_v3(country, service=service, operator=operator)
-    except TemporaError as exc:
-        log.info("price lookup for %s/%s failed: %s", service, operator, exc)
-        return None
-    providers = parse_v3_providers(data, country, service) or {}
+    providers: dict = {}
+    cached = _stock_cache.get("merged", {}).get(service) if _stock_cache.get("country") == country else None
+    if cached:
+        providers = cached if not operator.isdigit() else {operator: cached.get(operator, (0, []))}
+    if not providers or not any(ps for _, ps in providers.values()):
+        # Routing modes return nothing useful from getPricesV3; ask a real id.
+        lookup_op = operator if operator.isdigit() else list_operator()
+        try:
+            data = await api.get_prices_v3(country, service=service, operator=lookup_op)
+        except TemporaError as exc:
+            log.info("price lookup for %s/%s failed: %s", service, lookup_op, exc)
+            return None
+        providers = parse_v3_providers(data, country, service) or {}
     prices = [p for _, ps in providers.values() for p in ps]
     return math.ceil(max(prices)) if prices else None
 
@@ -743,6 +750,12 @@ async def sweep_stock(country: str, max_age: float = 0) -> tuple[dict[str, dict]
     return merged, errors
 
 
+def stocked_operators(code: str) -> list[str]:
+    """Operator ids listing stock for `code` in the cached sweep, most first."""
+    providers = _stock_cache.get("merged", {}).get(code, {})
+    return [pid for pid, (c, _) in sorted(providers.items(), key=lambda kv: -kv[1][0]) if c]
+
+
 def best_operator(providers: dict) -> tuple[str, int, float | None] | None:
     """(operator, count, lowest price) with the most stock, or None."""
     live = [(pid, c, ps[0] if ps else None) for pid, (c, ps) in providers.items() if c]
@@ -759,6 +772,12 @@ def fmt_providers(providers: dict) -> str:
         price = f"@{prices[0]:g}" if prices else ""
         parts.append(f"op{pid} {count}{price}")
     return ", ".join(parts) or "—"
+
+
+def alpha_key(name: str) -> str:
+    """Sort key that files '88pika' under P and '7Eleven' under E."""
+    stripped = re.sub(r"^[^A-Za-z\u0080-\uffff]+", "", name.strip()).lower()
+    return stripped or name.lower()
 
 
 STOCK_PAGE = 15
@@ -863,7 +882,7 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         title = "all services with stock"
 
     # Alphabetical by display name (code when unnamed), so paging is browsable.
-    ranked = sorted(picked.items(), key=lambda kv: (names.get(kv[0], kv[0]).lower(), kv[0]))
+    ranked = sorted(picked.items(), key=lambda kv: (alpha_key(names.get(kv[0], kv[0])), kv[0]))
     _stock_view.clear()
     _stock_view.update(title=title, ranked=ranked, single=len(ranked) == 1, errors=errors)
     text, markup = render_stock_page(0, names)
@@ -979,8 +998,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if action == "buy":
         code, _, op = act_id.partition(":")
+        if op:
+            candidates: list[str] = [op]
+        else:
+            candidates = stocked_operators(code)
+            candidates += [m for m in (current_operator, "smart") if m not in candidates]
         await query.answer(f"Buying {code}" + (f" via op{op}" if op else ""))
-        await do_buy(context, query.message, code, DEFAULT_COUNTRY, None, op or None)
+        await do_buy(context, query.message, code, DEFAULT_COUNTRY, None, candidates)
         return
 
     act = store.get(act_id)
