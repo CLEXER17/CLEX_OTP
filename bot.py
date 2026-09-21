@@ -416,19 +416,26 @@ async def do_buy(
                 break
             except TemporaError as exc:
                 tag = f"{service} {op_label(operator)}" if len(services) > 1 else op_label(operator)
-                failures.append(f"{tag}: {exc.code}")
+                why = exc.code
+                if exc.code in ("HTTP_ERROR", "NETWORK_ERROR") and exc.raw:
+                    why = f"{exc.code} ({exc.raw[:60]})"
+                failures.append(f"{tag}: {why}")
                 if exc.code not in _TRY_NEXT:
                     break
         if act_id is None:
-            last = failures[-1].split(": ", 1)[1] if failures else "?"
+            last_full = failures[-1].split(": ", 1)[1] if failures else "?"
+            last = last_full.split(" (", 1)[0]
             hint = ""
             if last == "WRONG_MAX_PRICE":
                 hint = f"\nPass a cap: /buy {service} PRICE  (see /stock {service})"
             elif last == "BAD_SERVICE" and len(services) == 1:
                 hint = f"\nFind the code: /services {service}"
-            detail = "\n".join(failures) if len(failures) > 1 else str(
-                TemporaError(last)
-            )
+            if len(failures) > 1:
+                detail = "\n".join(failures)
+            else:
+                detail = str(TemporaError(last))
+                if " (" in last_full:
+                    detail += " (" + last_full.split(" (", 1)[1]
             names = await service_names()
             if len(services) == 1:
                 label = f"{service} ({names[service]})" if service in names else service

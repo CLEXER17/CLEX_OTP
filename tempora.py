@@ -237,9 +237,12 @@ class TemporaSMS:
                 return data
             raise TemporaError("UNEXPECTED_RESPONSE", body)
         except TemporaError as exc:
-            if exc.code not in ("BAD_ACTION", "BAD_JSON", "UNEXPECTED_RESPONSE"):
+            # V2 is newer and less reliable than the bare-text endpoint; any
+            # sign it is not behaving (unknown action, non-JSON, HTTP status)
+            # means retry the purchase through getNumber instead.
+            if exc.code not in ("BAD_ACTION", "BAD_JSON", "UNEXPECTED_RESPONSE", "HTTP_ERROR"):
                 raise
-            log.info("getNumberV2 unavailable (%s); using getNumber", exc.code)
+            log.info("getNumberV2 unavailable (%s %s); using getNumber", exc.code, exc.raw[:80])
             act_id, phone = await self.get_number(
                 service, country, operator=operator, max_price=max_price
             )
