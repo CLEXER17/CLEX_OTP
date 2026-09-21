@@ -431,7 +431,7 @@ async def do_buy(
 _any_service: str = ANY_SERVICE
 _ANY_PATTERNS = (
     r"^any$", r"^other$", r"^any other", r"^any service", r"^any app",
-    r"^other service", r"^all$", r"^all service", r"^universal", r"^full$",
+    r"^other service", r"^all$", r"^all service", r"^full$",
 )
 
 
