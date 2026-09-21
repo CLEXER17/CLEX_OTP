@@ -20,6 +20,7 @@ import asyncio
 import html
 import logging
 import math
+import re
 import os
 import sys
 import time
@@ -70,6 +71,9 @@ current_operator = DEFAULT_OPERATOR
 # routing modes despite the docs and need a numeric id. Modes stay valid for
 # getNumber. Used by the list commands when current_operator is a mode.
 LIST_OPERATOR = os.environ.get("LIST_OPERATOR", "1").strip()
+# Catch-all service code for /number (a number not bound to any app). Empty
+# means auto-detect from /services by name; /any CODE overrides at runtime.
+ANY_SERVICE = os.environ.get("ANY_SERVICE", "").strip()
 
 
 def list_operator() -> str:
@@ -220,14 +224,16 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) ->
 
 HELP = """<b>TemporaSMS bot</b>
 
+<code>/number</code>  get a number for any app (catch-all service)
 <code>{buy_usage}</code>
-  buy a number, e.g. <code>/buy wa</code>
+  number for one app, e.g. <code>/buy wa</code>
 <code>/active</code>   live activations
 <code>/recent</code>   last 15 activations
 <code>/balance</code>  wallet balance
 <code>/price SERVICE{country_arg}</code>
 <code>/stock</code>  every service with stock, per operator
 <code>/stock whatsapp</code>  one app, by name or code
+<code>/any [CODE]</code>  which service /number buys
 <code>/op [N]</code> · <code>/operators</code> · <code>/countries</code> · <code>/services</code>
 <code>/stats</code>    local counters
 
@@ -282,6 +288,11 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("MAXPRICE must be a number.")
             return
 
+    await do_buy(context, msg, service, country, max_price)
+
+
+async def do_buy(context, msg, service: str, country: str, max_price: float | None) -> None:
+    """Buy one activation and post its card. Shared by /buy and /number."""
     async with buy_lock:
         live = store.live()
         if len(live) >= MAX_LIVE:
@@ -341,6 +352,73 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await refresh_card(context, act)
     log.info("bought %s for service=%s country=%s", phone, service, country)
+
+
+_any_service: str = ANY_SERVICE
+_ANY_PATTERNS = (
+    r"^any$", r"^other$", r"^any other", r"^all$", r"^all services",
+    r"^full$", r"\bany app\b", r"\bother\b", r"\bany\b", r"\ball\b",
+)
+
+
+async def resolve_any_service() -> str | None:
+    """Catch-all service code: env/override, else first name match in /services."""
+    global _any_service
+    if _any_service:
+        return _any_service
+    names = await service_names()
+    lowered = {code: name.lower().strip() for code, name in names.items()}
+    for pattern in _ANY_PATTERNS:
+        for code, name in lowered.items():
+            if re.search(pattern, name):
+                _any_service = code
+                log.info("catch-all service auto-detected: %s (%s)", code, names[code])
+                return code
+    return None
+
+
+@admin_only
+async def cmd_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show or set the catch-all service used by /number."""
+    global _any_service
+    args = context.args or []
+    if args:
+        _any_service = args[0]
+        await update.effective_message.reply_text(f"/number will buy service {_any_service}.")
+        return
+    code = await resolve_any_service()
+    names = await service_names()
+    if code:
+        await update.effective_message.reply_text(
+            f"/number buys {code} ({names.get(code, '?')}). Change with /any CODE."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "No catch-all service detected. Find it with /services other "
+            "(or any / all) and set it with /any CODE."
+        )
+
+
+@admin_only
+async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Buy a catch-all number - no app asked. Optional PRICE cap."""
+    msg = update.effective_message
+    args = context.args or []
+    max_price = None
+    if args:
+        try:
+            max_price = float(args[0])
+        except ValueError:
+            await msg.reply_text("Usage: /number [MAXPRICE]")
+            return
+    code = await resolve_any_service()
+    if not code:
+        await msg.reply_text(
+            "No catch-all service set. Run /services other (or any / all), "
+            "then /any CODE. Or buy for one app: /buy CODE."
+        )
+        return
+    await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price)
 
 
 @admin_only
@@ -794,6 +872,8 @@ def main() -> None:
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("buy", cmd_buy))
+    app.add_handler(CommandHandler(["number", "num", "get"], cmd_number))
+    app.add_handler(CommandHandler("any", cmd_any))
     app.add_handler(CommandHandler("active", cmd_active))
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CommandHandler("price", cmd_price))

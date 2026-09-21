@@ -30,7 +30,9 @@ multi-user path in this build.
 ## Commands
 
 ```
-/buy SERVICE [MAXPRICE]           buy a number, e.g. /buy wa
+/number [MAXPRICE]                catch-all number, no app asked (aliases /num /get)
+/any [CODE]                       show or set the catch-all service /number buys
+/buy SERVICE [MAXPRICE]           number for one app, e.g. /buy wa
                                   (COUNTRY arg appears after SERVICE when LOCK_COUNTRY=0)
 /active                           live activations with buttons
 /recent                           last 15
