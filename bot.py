@@ -437,7 +437,11 @@ async def do_buy(
             if last == "WRONG_MAX_PRICE":
                 hint = f"\nPass a cap: /buy {service} PRICE  (see /stock {service})"
             elif last == "BAD_SERVICE" and len(services) == 1:
-                hint = f"\nFind the code: /services {service}"
+                known = service in await service_names()
+                hint = (
+                    "\nProvider refuses to sell this service via API right now."
+                    if known else f"\nFind the code: /services {service}"
+                )
             if len(failures) > 1:
                 detail = "\n".join(failures)
             else:
