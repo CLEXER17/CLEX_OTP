@@ -29,6 +29,8 @@ multi-user path in this build.
 
 ## Commands
 
+`/start` shows a persistent menu keyboard (Get number · Active · Stock · Balance · Cancel · Help). `/stock` results carry inline **Buy** buttons per operator.
+
 ```
 /number [MAXPRICE]                catch-all number, no app asked (aliases /num /get)
 /any [CODE]                       show or set the catch-all service /number buys

@@ -28,6 +28,7 @@ import time
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -37,6 +38,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from store import CANCELLED, DONE, EXPIRED, LIVE, Activation, Store
@@ -152,6 +155,16 @@ COUNTRY_ARG = "" if LOCK_COUNTRY else " [COUNTRY]"
 BUY_USAGE = f"/buy SERVICE{'' if LOCK_COUNTRY else ' COUNTRY'} [MAXPRICE]"
 
 
+BTN_NUMBER, BTN_ACTIVE = "📱 Get number", "📋 Active"
+BTN_STOCK, BTN_BALANCE = "📊 Stock", "💰 Balance"
+BTN_CANCEL, BTN_HELP = "🛑 Cancel", "❓ Help"
+MAIN_MENU = ReplyKeyboardMarkup(
+    [[BTN_NUMBER, BTN_ACTIVE], [BTN_STOCK, BTN_BALANCE], [BTN_CANCEL, BTN_HELP]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
 def keyboard(act: Activation) -> InlineKeyboardMarkup | None:
     """Action buttons for a live activation."""
     if act.state != LIVE:
@@ -261,7 +274,9 @@ HELP = HELP.format(
 
 @admin_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(
+        HELP, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU
+    )
 
 
 @admin_only
@@ -297,8 +312,12 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await do_buy(context, msg, service, country, max_price)
 
 
-async def do_buy(context, msg, service: str, country: str, max_price: float | None) -> None:
-    """Buy one activation and post its card. Shared by /buy and /number."""
+async def do_buy(
+    context, msg, service: str, country: str, max_price: float | None,
+    operator: str | None = None,
+) -> None:
+    """Buy one activation and post its card. Shared by /buy, /number, buttons."""
+    operator = operator or current_operator
     async with buy_lock:
         live = store.live()
         if len(live) >= MAX_LIVE:
@@ -314,17 +333,17 @@ async def do_buy(context, msg, service: str, country: str, max_price: float | No
         try:
             try:
                 act_id, phone = await api.get_number(
-                    service, country, operator=current_operator, max_price=cap
+                    service, country, operator=operator, max_price=cap
                 )
             except TemporaError as exc:
                 if exc.code != "WRONG_MAX_PRICE" or cap is not None:
                     raise
-                cap = await live_max_price(service, country, current_operator)
+                cap = await live_max_price(service, country, operator)
                 if cap is None:
                     raise
                 await status_msg.edit_text(f"Buying… (multi-price operator, cap {cap})")
                 act_id, phone = await api.get_number(
-                    service, country, operator=current_operator, max_price=cap
+                    service, country, operator=operator, max_price=cap
                 )
         except TemporaError as exc:
             hint = ""
@@ -450,6 +469,23 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "HAS_CODE": "A code already arrived; cancel is refused. Use Done.",
     }
     await msg.reply_text(replies.get(result, f"Cancel rejected: {result}"))
+
+
+@admin_only
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Persistent keyboard presses arrive as plain text."""
+    text = (update.effective_message.text or "").strip()
+    context.args = []
+    handler = {
+        BTN_NUMBER: cmd_number,
+        BTN_ACTIVE: cmd_active,
+        BTN_STOCK: cmd_stock,
+        BTN_BALANCE: cmd_balance,
+        BTN_CANCEL: cmd_cancel,
+        BTN_HELP: cmd_start,
+    }.get(text)
+    if handler:
+        await handler(update, context)
 
 
 @admin_only
@@ -684,6 +720,7 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         key=lambda kv: -sum(c for c, _ in kv[1].values()),
     )
     lines = [f"<b>India · {title}</b>", ""]
+    buttons: list[list[InlineKeyboardButton]] = []
     shown = 0
     for code, providers in ranked:
         total = sum(c for c, _ in providers.values())
@@ -696,13 +733,48 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if shown >= 40:
             lines.append(f"… {len(ranked) - shown} more; narrow with /stock NAME")
             break
+
+    # Buy buttons: one service -> a button per operator that has stock;
+    # overview -> one button per top service using the current operator.
+    if len(ranked) == 1 and shown:
+        code, providers = ranked[0]
+        row: list[InlineKeyboardButton] = []
+        for pid, (count, prices) in sorted(providers.items(), key=lambda kv: -kv[1][0]):
+            if not count:
+                continue
+            price = f" @{prices[0]:g}" if prices else ""
+            row.append(InlineKeyboardButton(
+                f"op{pid} · {count}{price}", callback_data=f"buy:{code}:{pid}"
+            ))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+    else:
+        row = []
+        for code, providers in ranked[:8]:
+            if not sum(c for c, _ in providers.values()):
+                continue
+            short = (names.get(code) or code)[:14]
+            row.append(InlineKeyboardButton(f"Buy {short}", callback_data=f"buy:{code}:"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
     if shown == 0:
         lines.append("nothing in stock")
     if errors:
         lines += ["", "<i>" + esc("; ".join(errors)) + "</i>"]
-    lines += ["", "buy: <code>/op N</code> then <code>/buy CODE</code>"]
+    if not buttons:
+        lines += ["", "buy: <code>/op N</code> then <code>/buy CODE</code>"]
     text = "\n".join(lines)
-    await status.edit_text(text[:4000], parse_mode=ParseMode.HTML)
+    await status.edit_text(
+        text[:4000], parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
 
 
 @admin_only
@@ -795,8 +867,14 @@ async def cancel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action, _, act_id = (query.data or "").partition(":")
-    act = store.get(act_id)
 
+    if action == "buy":
+        code, _, op = act_id.partition(":")
+        await query.answer(f"Buying {code}" + (f" via op{op}" if op else ""))
+        await do_buy(context, query.message, code, DEFAULT_COUNTRY, None, op or None)
+        return
+
+    act = store.get(act_id)
     if not act:
         await query.answer("Unknown activation.", show_alert=True)
         return
@@ -984,6 +1062,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu))
     app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(
