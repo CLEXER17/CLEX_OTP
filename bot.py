@@ -545,15 +545,24 @@ async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except TemporaError as exc:
         log.info("stock lookup for /number failed: %s", exc)
 
-    plan: list[tuple[str, str]] = []
+    # Cheapest stocked option first across all codes; a pinned code (/any)
+    # still goes first. Unpriced entries and the router modes come last.
+    priced: list[tuple[float, str, str]] = []
     for code in codes:
-        ops = [pid for pid, _, _ in stocked_with_counts(code)]
-        plan += [(code, op) for op in ops]
-        plan += [(code, m) for m in ("smart", "best")]
+        for pid, count, price in stocked_with_counts(code):
+            priced.append((price if price is not None else 1e9, code, pid))
+    priced.sort()
+    plan: list[tuple[str, str]] = []
+    if _any_service and _any_service in codes:
+        plan += [(code, op) for _, code, op in priced if code == _any_service]
+    plan += [(code, op) for _, code, op in priced if (code, op) not in plan]
+    plan += [(code, m) for code in codes for m in ("smart", "best")]
     names = await service_names()
-    await msg.reply_text(
-        "Trying: " + ", ".join(f"{c} ({names.get(c, '?')})" for c in codes)
+    shown = ", ".join(
+        f"{code}/op{op} @{price:g}" if price < 1e9 else f"{code}/op{op}"
+        for price, code, op in priced[:6]
     )
+    await msg.reply_text(f"Trying cheapest first: {shown or ', '.join(codes)}")
     await do_buy(context, msg, codes[0], DEFAULT_COUNTRY, max_price, plan=plan)
 
 
