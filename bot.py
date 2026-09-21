@@ -443,7 +443,28 @@ async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "then /any CODE. Or buy for one app: /buy CODE."
         )
         return
-    await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price)
+    names = await service_names()
+    label = f"{code} ({names.get(code, 'unnamed')})"
+    # Route to the operator that actually holds stock for this service.
+    operator = None
+    try:
+        merged, _ = await sweep_stock(DEFAULT_COUNTRY, max_age=STOCK_CACHE_TTL)
+        best = best_operator(merged.get(code, {}))
+        if best:
+            operator, count, price = best
+            await msg.reply_text(
+                f"{label}: op{operator} has {count} @ {price:g}" if price is not None
+                else f"{label}: op{operator} has {count}"
+            )
+        else:
+            await msg.reply_text(
+                f"No operator has stock for {label} right now. "
+                "Check /stock or change it with /any CODE."
+            )
+            return
+    except TemporaError as exc:
+        log.info("stock lookup for /number failed: %s", exc)
+    await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price, operator)
 
 
 @admin_only
@@ -621,23 +642,49 @@ async def live_max_price(service: str, country: str, operator: str) -> int | Non
     return math.ceil(max(prices)) if prices else None
 
 
+async def operator_ids() -> list[str]:
+    ops = await api.get_operators()
+    values = ops.values() if isinstance(ops, dict) else ops
+    return sorted({str(v) for v in values if str(v).isdigit()}, key=int)
+
+
 async def service_names() -> dict[str, str]:
-    """code -> display name, fetched once per process."""
+    """code -> display name, merged across every operator, once per process.
+
+    Each operator carries its own catalogue; a code missing from one list is
+    often present in another.
+    """
     if not _services_cache:
         try:
-            data = await api.get_services(operator=list_operator())
-            if isinstance(data, dict):
-                _services_cache.update({str(k): str(v) for k, v in data.items()})
+            op_ids = await operator_ids()
         except TemporaError as exc:
-            log.warning("getServices failed: %s", exc)
+            log.warning("getOperators failed: %s", exc)
+            op_ids = [list_operator()]
+        for op in op_ids:
+            try:
+                data = await api.get_services(operator=op)
+            except TemporaError as exc:
+                log.warning("getServices(op=%s) failed: %s", op, exc)
+                continue
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    _services_cache.setdefault(str(k), str(v))
     return _services_cache
 
 
-async def sweep_stock(country: str) -> tuple[dict[str, dict], list[str]]:
-    """getPricesV3 for every operator, merged: {service: {provider: (count, prices)}}."""
-    ops = await api.get_operators()
-    values = ops.values() if isinstance(ops, dict) else ops
-    op_ids = sorted({str(v) for v in values if str(v).isdigit()}, key=int)
+STOCK_CACHE_TTL = 120  # seconds a sweep stays fresh for paging and /number
+_stock_cache: dict = {}  # {"ts", "country", "merged", "errors"}
+
+
+async def sweep_stock(country: str, max_age: float = 0) -> tuple[dict[str, dict], list[str]]:
+    """getPricesV3 for every operator, merged: {service: {provider: (count, prices)}}.
+
+    A sweep younger than max_age seconds is reused.
+    """
+    c = _stock_cache
+    if c and c["country"] == country and time.time() - c["ts"] < max_age:
+        return c["merged"], c["errors"]
+    op_ids = await operator_ids()
 
     merged: dict[str, dict] = {}
     errors: list[str] = []
@@ -658,7 +705,16 @@ async def sweep_stock(country: str) -> tuple[dict[str, dict], list[str]]:
             for pid, (count, prices) in providers.items():
                 if pid not in slot or count > slot[pid][0]:
                     slot[pid] = (count, prices)
+    _stock_cache.update(ts=time.time(), country=country, merged=merged, errors=errors)
     return merged, errors
+
+
+def best_operator(providers: dict) -> tuple[str, int, float | None] | None:
+    """(operator, count, lowest price) with the most stock, or None."""
+    live = [(pid, c, ps[0] if ps else None) for pid, (c, ps) in providers.items() if c]
+    if not live:
+        return None
+    return max(live, key=lambda t: t[1])
 
 
 def fmt_providers(providers: dict) -> str:
@@ -671,9 +727,68 @@ def fmt_providers(providers: dict) -> str:
     return ", ".join(parts) or "—"
 
 
+STOCK_PAGE = 15
+_stock_view: dict = {}  # last /stock result for paging: {"title", "ranked", "single"}
+
+
+def render_stock_page(page: int, names: dict[str, str]) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Text + buttons for one page of the cached /stock view."""
+    view = _stock_view
+    ranked = view["ranked"]
+    pages = max(1, math.ceil(len(ranked) / STOCK_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = ranked[page * STOCK_PAGE:(page + 1) * STOCK_PAGE]
+
+    lines = [f"<b>India · {view['title']}</b>  (page {page + 1}/{pages}, {len(ranked)} services)", ""]
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    for code, providers in chunk:
+        total = sum(c for c, _ in providers.values())
+        name = names.get(code, "")
+        label = f"<code>{esc(code)}</code> {esc(name)}".strip()
+        lines.append(f"{label}: <b>{total}</b>  ({esc(fmt_providers(providers))})")
+
+    if view["single"] and chunk:
+        code, providers = chunk[0]
+        for pid, (count, prices) in sorted(providers.items(), key=lambda kv: -kv[1][0]):
+            if not count:
+                continue
+            price = f" @{prices[0]:g}" if prices else ""
+            row.append(InlineKeyboardButton(f"op{pid} · {count}{price}", callback_data=f"buy:{code}:{pid}"))
+            if len(row) == 2:
+                buttons.append(row); row = []
+    else:
+        for code, providers in chunk:
+            if not sum(c for c, _ in providers.values()):
+                continue
+            short = (names.get(code) or code)[:14]
+            row.append(InlineKeyboardButton(f"Buy {short}", callback_data=f"buy:{code}:"))
+            if len(row) == 2:
+                buttons.append(row); row = []
+    if row:
+        buttons.append(row)
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"pg:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="pg:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"pg:{page + 1}"))
+        buttons.append(nav)
+
+    if not ranked:
+        lines.append("nothing in stock")
+    if view.get("errors"):
+        lines += ["", "<i>" + esc("; ".join(view["errors"])) + "</i>"]
+    lines += ["", "tap Buy, or <code>/stock NAME</code> to narrow"]
+    return "\n".join(lines)[:4000], InlineKeyboardMarkup(buttons) if buttons else None
+
+
 @admin_only
 async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Live stock per operator for India.
+    """Live stock per operator for India, paged.
 
     /stock            every service with stock, biggest first
     /stock wa         one service by code
@@ -681,12 +796,12 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     msg = update.effective_message
     args = context.args or []
-    country, rest = split_country(args) if args else (DEFAULT_COUNTRY, [])
+    country, _ = split_country(args) if args else (DEFAULT_COUNTRY, [])
     query = args[0].lower() if args else ""
 
     status = await msg.reply_text("Sweeping operators…")
     try:
-        merged, errors = await sweep_stock(country)
+        merged, errors = await sweep_stock(country, max_age=STOCK_CACHE_TTL)
     except TemporaError as exc:
         await status.edit_text(f"Error: {exc}")
         return
@@ -696,15 +811,12 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if query in merged or query in names:
             picked = {query: merged.get(query, {})}
         else:
-            picked = {
-                code: prov for code, prov in merged.items()
-                if query in names.get(code, "").lower()
-            }
+            picked = {c: p for c, p in merged.items() if query in names.get(c, "").lower()}
             if not picked:
                 hits = [c for c, n in names.items() if query in n.lower()]
                 if hits:
                     await status.edit_text(
-                        f"No stock right now for: " +
+                        "No stock right now for: " +
                         ", ".join(f"{c} ({names[c]})" for c in hits[:10])
                     )
                 else:
@@ -712,69 +824,14 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
         title = f"stock for '{esc(query)}'"
     else:
-        picked = merged
+        picked = {c: p for c, p in merged.items() if sum(x for x, _ in p.values())}
         title = "all services with stock"
 
-    ranked = sorted(
-        picked.items(),
-        key=lambda kv: -sum(c for c, _ in kv[1].values()),
-    )
-    lines = [f"<b>India · {title}</b>", ""]
-    buttons: list[list[InlineKeyboardButton]] = []
-    shown = 0
-    for code, providers in ranked:
-        total = sum(c for c, _ in providers.values())
-        if not total and not query:
-            continue
-        name = names.get(code, "")
-        label = f"<code>{esc(code)}</code> {esc(name)}".strip()
-        lines.append(f"{label}: <b>{total}</b>  ({esc(fmt_providers(providers))})")
-        shown += 1
-        if shown >= 40:
-            lines.append(f"… {len(ranked) - shown} more; narrow with /stock NAME")
-            break
-
-    # Buy buttons: one service -> a button per operator that has stock;
-    # overview -> one button per top service using the current operator.
-    if len(ranked) == 1 and shown:
-        code, providers = ranked[0]
-        row: list[InlineKeyboardButton] = []
-        for pid, (count, prices) in sorted(providers.items(), key=lambda kv: -kv[1][0]):
-            if not count:
-                continue
-            price = f" @{prices[0]:g}" if prices else ""
-            row.append(InlineKeyboardButton(
-                f"op{pid} · {count}{price}", callback_data=f"buy:{code}:{pid}"
-            ))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-    else:
-        row = []
-        for code, providers in ranked[:8]:
-            if not sum(c for c, _ in providers.values()):
-                continue
-            short = (names.get(code) or code)[:14]
-            row.append(InlineKeyboardButton(f"Buy {short}", callback_data=f"buy:{code}:"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-
-    if shown == 0:
-        lines.append("nothing in stock")
-    if errors:
-        lines += ["", "<i>" + esc("; ".join(errors)) + "</i>"]
-    if not buttons:
-        lines += ["", "buy: <code>/op N</code> then <code>/buy CODE</code>"]
-    text = "\n".join(lines)
-    await status.edit_text(
-        text[:4000], parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-    )
+    ranked = sorted(picked.items(), key=lambda kv: -sum(c for c, _ in kv[1].values()))
+    _stock_view.clear()
+    _stock_view.update(title=title, ranked=ranked, single=len(ranked) == 1, errors=errors)
+    text, markup = render_stock_page(0, names)
+    await status.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 @admin_only
@@ -867,6 +924,22 @@ async def cancel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action, _, act_id = (query.data or "").partition(":")
+
+    if action == "pg":
+        if act_id == "noop":
+            await query.answer()
+            return
+        if not _stock_view:
+            await query.answer("Stock view expired — run /stock again.", show_alert=True)
+            return
+        text, markup = render_stock_page(int(act_id), await service_names())
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+        await query.answer()
+        return
 
     if action == "buy":
         code, _, op = act_id.partition(":")
