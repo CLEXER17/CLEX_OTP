@@ -65,6 +65,14 @@ LOCK_COUNTRY = os.environ.get("LOCK_COUNTRY", "1").strip().lower() in ("1", "tru
 OPERATOR_MODES = ("smart", "auto", "cheap", "best")
 DEFAULT_OPERATOR = os.environ.get("DEFAULT_OPERATOR", "smart").strip()
 current_operator = DEFAULT_OPERATOR
+# Observed live 2026-09-21: getServices/getCountries/getPrices reject the
+# routing modes despite the docs and need a numeric id. Modes stay valid for
+# getNumber. Used by the list commands when current_operator is a mode.
+LIST_OPERATOR = os.environ.get("LIST_OPERATOR", "1").strip()
+
+
+def list_operator() -> str:
+    return current_operator if current_operator.isdigit() else LIST_OPERATOR
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 # Activation window in seconds. 20 min is the protocol convention - confirm
 # against your account and adjust if TemporaSMS uses a different window.
@@ -355,7 +363,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     country, _ = split_country(args)
     try:
         data = await api.get_prices(
-            service=service, country=country, operator=current_operator
+            service=service, country=country, operator=list_operator()
         )
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
@@ -401,7 +409,7 @@ async def cmd_operators(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @admin_only
 async def cmd_countries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        data = await api.get_countries(operator=current_operator)
+        data = await api.get_countries(operator=list_operator())
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
         return
@@ -414,7 +422,7 @@ async def cmd_countries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     try:
-        data = await api.get_services(operator=current_operator)
+        data = await api.get_services(operator=list_operator())
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
         return
