@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import math
 import os
 import sys
 import time
@@ -38,7 +39,7 @@ from telegram.ext import (
 )
 
 from store import CANCELLED, DONE, EXPIRED, LIVE, Activation, Store
-from tempora import TemporaError, TemporaSMS, parse_v3_country
+from tempora import TemporaError, TemporaSMS, parse_v3_country, parse_v3_providers
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
@@ -291,12 +292,30 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         status_msg = await msg.reply_text("Buying…")
+        # The API wants an integer cap; round a fractional one up.
+        cap = math.ceil(max_price) if max_price is not None else None
         try:
-            act_id, phone = await api.get_number(
-                service, country, operator=current_operator, max_price=max_price
-            )
+            try:
+                act_id, phone = await api.get_number(
+                    service, country, operator=current_operator, max_price=cap
+                )
+            except TemporaError as exc:
+                if exc.code != "WRONG_MAX_PRICE" or cap is not None:
+                    raise
+                cap = await live_max_price(service, country, current_operator)
+                if cap is None:
+                    raise
+                await status_msg.edit_text(f"Buying… (multi-price operator, cap {cap})")
+                act_id, phone = await api.get_number(
+                    service, country, operator=current_operator, max_price=cap
+                )
         except TemporaError as exc:
-            await status_msg.edit_text(f"Could not buy a number.\n{exc}")
+            hint = ""
+            if exc.code == "WRONG_MAX_PRICE":
+                hint = f"\nPass a cap: /buy {service} PRICE  (see /stock {service})"
+            elif exc.code == "BAD_SERVICE":
+                hint = f"\nFind the code: /services {service}"
+            await status_msg.edit_text(f"Could not buy a number.\n{exc}{hint}")
             return
 
         now = time.time()
@@ -439,6 +458,22 @@ async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 _services_cache: dict[str, str] = {}
+
+
+async def live_max_price(service: str, country: str, operator: str) -> int | None:
+    """Highest current price for the service on this operator, as an integer cap.
+
+    Multi-price operators refuse getNumber without maxPrice (WRONG_MAX_PRICE);
+    the cap is the largest live option so any of them can be reserved.
+    """
+    try:
+        data = await api.get_prices_v3(country, service=service, operator=operator)
+    except TemporaError as exc:
+        log.info("price lookup for %s/%s failed: %s", service, operator, exc)
+        return None
+    providers = parse_v3_providers(data, country, service) or {}
+    prices = [p for _, ps in providers.values() for p in ps]
+    return math.ceil(max(prices)) if prices else None
 
 
 async def service_names() -> dict[str, str]:
