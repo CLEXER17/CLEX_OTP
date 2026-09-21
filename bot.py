@@ -342,15 +342,21 @@ _TRY_NEXT = ("BAD_SERVICE", "NO_NUMBERS", "BAD_OPERATOR", "WRONG_MAX_PRICE", "ER
 async def do_buy(
     context, msg, service: str, country: str, max_price: float | None,
     operator: str | list[str] | None = None,
+    plan: list[tuple[str, str]] | None = None,
 ) -> None:
     """Buy one activation and post its card. Shared by /buy, /number, buttons.
 
-    `operator` may be a list: each is tried in turn until one sells.
+    `operator` may be a list: each is tried in turn until one sells. `plan`
+    is the general form - (service, operator) pairs tried in order - and
+    overrides `service`/`operator` when given.
     """
-    candidates = [operator] if isinstance(operator, str) else list(operator or [])
-    if not candidates:
-        candidates = [current_operator]
-    candidates = list(dict.fromkeys(candidates))  # dedupe, keep order
+    if plan is None:
+        candidates = [operator] if isinstance(operator, str) else list(operator or [])
+        if not candidates:
+            candidates = [current_operator]
+        plan = [(service, op) for op in candidates]
+    plan = list(dict.fromkeys(plan))  # dedupe, keep order
+    services = list(dict.fromkeys(svc for svc, _ in plan))
     async with buy_lock:
         live = store.live()
         if len(live) >= MAX_LIVE:
@@ -365,14 +371,16 @@ async def do_buy(
         cap = math.ceil(max_price) if max_price is not None else None
         failures: list[str] = []
         act_id = phone = None
-        for operator in candidates:
-            if len(candidates) > 1:
-                await status_msg.edit_text(f"Buying via {op_label(operator)}…")
+        for service, operator in plan:
+            if len(plan) > 1:
+                where = f"{service} via {op_label(operator)}" if len(services) > 1 else op_label(operator)
+                await status_msg.edit_text(f"Buying {where}…")
             try:
                 act_id, phone = await buy_once(status_msg, service, country, operator, cap)
                 break
             except TemporaError as exc:
-                failures.append(f"{op_label(operator)}: {exc.code}")
+                tag = f"{service} {op_label(operator)}" if len(services) > 1 else op_label(operator)
+                failures.append(f"{tag}: {exc.code}")
                 if exc.code not in _TRY_NEXT:
                     break
         if act_id is None:
@@ -380,16 +388,19 @@ async def do_buy(
             hint = ""
             if last == "WRONG_MAX_PRICE":
                 hint = f"\nPass a cap: /buy {service} PRICE  (see /stock {service})"
-            elif last == "BAD_SERVICE":
+            elif last == "BAD_SERVICE" and len(services) == 1:
                 hint = f"\nFind the code: /services {service}"
             detail = "\n".join(failures) if len(failures) > 1 else str(
                 TemporaError(last)
             )
             names = await service_names()
-            label = f"{service} ({names[service]})" if service in names else service
+            if len(services) == 1:
+                label = f"{service} ({names[service]})" if service in names else service
+            else:
+                label = f"any of {len(services)} catch-all services"
             await status_msg.edit_text(f"Could not buy {label}.\n{detail}{hint}")
             return
-        if len(candidates) > 1:
+        if len(plan) > 1:
             log.info("bought %s on %s after %s", service, op_label(operator), failures or "no failures")
 
         now = time.time()
@@ -420,51 +431,75 @@ async def do_buy(
 _any_service: str = ANY_SERVICE
 _ANY_PATTERNS = (
     r"^any$", r"^other$", r"^any other", r"^any service", r"^any app",
-    r"^other service", r"^all$", r"^all service", r"^universal",
+    r"^other service", r"^all$", r"^all service", r"^universal", r"^full$",
 )
 
 
-async def resolve_any_service() -> str | None:
-    """Catch-all service code: env/override, else first name match in /services."""
-    global _any_service
-    if _any_service:
-        return _any_service
+async def catch_all_services() -> list[str]:
+    """Every catch-all-looking service code, preferred one first.
+
+    /any CODE or ANY_SERVICE pins the first choice; the rest are name matches
+    from the merged catalogues, in pattern order.
+    """
     names = await service_names()
     lowered = {code: name.lower().strip() for code, name in names.items()}
+    found: list[str] = [_any_service] if _any_service else []
     for pattern in _ANY_PATTERNS:
         for code, name in lowered.items():
-            if re.search(pattern, name):
-                _any_service = code
-                log.info("catch-all service auto-detected: %s (%s)", code, names[code])
-                return code
-    return None
+            if re.search(pattern, name) and code not in found:
+                found.append(code)
+    return found
+
+
+def stocked_with_counts(code: str) -> list[tuple[str, int, float | None]]:
+    providers = _stock_cache.get("merged", {}).get(code, {})
+    return sorted(
+        ((pid, c, ps[0] if ps else None) for pid, (c, ps) in providers.items() if c),
+        key=lambda t: -t[1],
+    )
 
 
 @admin_only
 async def cmd_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show or set the catch-all service used by /number."""
+    """Show or pin the catch-all services used by /number."""
     global _any_service
+    msg = update.effective_message
     args = context.args or []
     if args:
-        _any_service = args[0]
-        await update.effective_message.reply_text(f"/number will buy service {_any_service}.")
+        _any_service = "" if args[0].lower() in ("auto", "reset", "clear") else args[0]
+        await msg.reply_text(
+            f"/number tries {_any_service} first." if _any_service
+            else "/number back to auto-detected catch-all services."
+        )
         return
-    code = await resolve_any_service()
+    codes = await catch_all_services()
+    if not codes:
+        await msg.reply_text(
+            "No catch-all service detected. Find one with /services other "
+            "(or any / all) and pin it with /any CODE."
+        )
+        return
     names = await service_names()
-    if code:
-        await update.effective_message.reply_text(
-            f"/number buys {code} ({names.get(code, '?')}). Change with /any CODE."
-        )
-    else:
-        await update.effective_message.reply_text(
-            "No catch-all service detected. Find it with /services other "
-            "(or any / all) and set it with /any CODE."
-        )
+    try:
+        await sweep_stock(DEFAULT_COUNTRY, max_age=STOCK_CACHE_TTL)
+    except TemporaError:
+        pass
+    lines = ["<b>/number tries, in order:</b>", ""]
+    for code in codes:
+        stock = stocked_with_counts(code)
+        where = ", ".join(f"op{p} {c}" for p, c, _ in stock[:4]) or "no stock listed"
+        lines.append(f"<code>{esc(code)}</code> {esc(names.get(code, ''))} — {esc(where)}")
+    lines += ["", "pin one: <code>/any CODE</code> · reset: <code>/any auto</code>"]
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @admin_only
 async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Buy a catch-all number - no app asked. Optional PRICE cap."""
+    """Buy a catch-all number - no app asked. Optional PRICE cap.
+
+    Walks every catch-all service, each across the operators that list stock
+    for it (then the router), until one sells.
+    """
     msg = update.effective_message
     args = context.args or []
     max_price = None
@@ -474,37 +509,28 @@ async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await msg.reply_text("Usage: /number [MAXPRICE]")
             return
-    code = await resolve_any_service()
-    if not code:
+    codes = await catch_all_services()
+    if not codes:
         await msg.reply_text(
-            "No catch-all service set. Run /services other (or any / all), "
+            "No catch-all service found. Run /services other (or any / all), "
             "then /any CODE. Or buy for one app: /buy CODE."
         )
         return
-    names = await service_names()
-    label = f"{code} ({names.get(code, 'unnamed')})"
-    # Try every operator that shows stock, most first, then the router modes.
-    operators: list[str] = []
     try:
-        merged, _ = await sweep_stock(DEFAULT_COUNTRY, max_age=STOCK_CACHE_TTL)
-        stocked = sorted(
-            ((pid, c, ps[0] if ps else None) for pid, (c, ps) in merged.get(code, {}).items() if c),
-            key=lambda t: -t[1],
-        )
-        operators = [pid for pid, _, _ in stocked]
-        if stocked:
-            summary = ", ".join(
-                f"op{pid} {c}" + (f"@{p:g}" if p is not None else "") for pid, c, p in stocked[:5]
-            )
-            await msg.reply_text(f"{label}: {summary}")
-        else:
-            await msg.reply_text(
-                f"No operator lists stock for {label} right now; trying the router anyway."
-            )
+        await sweep_stock(DEFAULT_COUNTRY, max_age=STOCK_CACHE_TTL)
     except TemporaError as exc:
         log.info("stock lookup for /number failed: %s", exc)
-    operators += [m for m in ("smart", "best") if m not in operators]
-    await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price, operators)
+
+    plan: list[tuple[str, str]] = []
+    for code in codes:
+        ops = [pid for pid, _, _ in stocked_with_counts(code)]
+        plan += [(code, op) for op in ops]
+        plan += [(code, m) for m in ("smart", "best")]
+    names = await service_names()
+    await msg.reply_text(
+        "Trying: " + ", ".join(f"{c} ({names.get(c, '?')})" for c in codes)
+    )
+    await do_buy(context, msg, codes[0], DEFAULT_COUNTRY, max_price, plan=plan)
 
 
 @admin_only
