@@ -207,6 +207,44 @@ class TemporaSMS:
             raise TemporaError("UNEXPECTED_RESPONSE", body)
         return parts[1].strip(), parts[2].strip()
 
+    async def get_number_v2(
+        self,
+        service: str,
+        country: str | int,
+        *,
+        operator: str | None = None,
+        max_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Buy an activation and return the JSON metadata.
+
+        {"success": true, "activationId": "...", "phoneNumber": 9147...,
+         "activationCost": 25, "countryCode": "IN", "canGetAnotherSms": true,
+         "activationTime": "...", "activationOperator": "3"}
+
+        Falls back to getNumber's bare-text shape (BAD_ACTION or non-JSON)
+        so callers get the same keys either way, minus cost/operator.
+        """
+        try:
+            body = await self._call(
+                "getNumberV2",
+                service=service,
+                country=country,
+                operator=operator,
+                maxPrice=max_price,
+            )
+            data = self._as_json(body)
+            if isinstance(data, dict) and data.get("activationId"):
+                return data
+            raise TemporaError("UNEXPECTED_RESPONSE", body)
+        except TemporaError as exc:
+            if exc.code not in ("BAD_ACTION", "BAD_JSON", "UNEXPECTED_RESPONSE"):
+                raise
+            log.info("getNumberV2 unavailable (%s); using getNumber", exc.code)
+            act_id, phone = await self.get_number(
+                service, country, operator=operator, max_price=max_price
+            )
+            return {"activationId": act_id, "phoneNumber": phone}
+
     async def get_status(self, activation_id: str) -> SmsStatus:
         """Poll one activation for its SMS.
 

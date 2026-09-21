@@ -203,9 +203,16 @@ def render(act: Activation) -> str:
         EXPIRED: "EXPIRED",
     }.get(act.state, act.state.upper())
 
+    name = _services_cache.get(act.service, "")
+    service = f"{esc(name)} <code>{esc(act.service)}</code>" if name else f"<code>{esc(act.service)}</code>"
+    meta = [service]
+    if act.operator:
+        meta.append(f"op {esc(act.operator)}")
+    if act.price is not None:
+        meta.append(f"price <b>{act.price:g}</b>")
     lines = [
         f"<b>{fmt_phone(act.phone)}</b>",
-        f"service <code>{esc(act.service)}</code> · country <code>{esc(act.country)}</code>",
+        " · ".join(meta),
         f"id <code>{esc(act.act_id)}</code> · {label}",
     ]
     if act.state == LIVE:
@@ -333,10 +340,14 @@ def op_label(operator: str) -> str:
 
 async def buy_once(
     status_msg, service: str, country: str, operator: str, cap: int | None
-) -> tuple[str, str]:
-    """One getNumber, auto-filling the price cap for multi-price operators."""
+) -> dict:
+    """One purchase, auto-filling the price cap for multi-price operators.
+
+    Returns getNumberV2's metadata (activationId, phoneNumber, and when the
+    provider supplies them, activationCost / activationOperator).
+    """
     try:
-        return await api.get_number(service, country, operator=operator, max_price=cap)
+        return await api.get_number_v2(service, country, operator=operator, max_price=cap)
     except TemporaError as exc:
         if exc.code != "WRONG_MAX_PRICE" or cap is not None:
             raise
@@ -344,7 +355,7 @@ async def buy_once(
         if cap is None:
             raise
         await status_msg.edit_text(f"Buying via {op_label(operator)}… (multi-price, cap {cap})")
-        return await api.get_number(service, country, operator=operator, max_price=cap)
+        return await api.get_number_v2(service, country, operator=operator, max_price=cap)
 
 
 # Rejections that mean "not from this operator" - worth trying the next one.
@@ -388,7 +399,8 @@ async def do_buy(
                 where = f"{service} via {op_label(operator)}" if len(services) > 1 else op_label(operator)
                 await status_msg.edit_text(f"Buying {where}…")
             try:
-                act_id, phone = await buy_once(status_msg, service, country, operator, cap)
+                meta = await buy_once(status_msg, service, country, operator, cap)
+                act_id, phone = str(meta["activationId"]), str(meta["phoneNumber"])
                 digits = phone.lstrip("+")
                 if NUMBER_PREFIX and not digits.startswith(NUMBER_PREFIX):
                     # Wrong country - give it back and keep looking.
@@ -428,6 +440,16 @@ async def do_buy(
             log.info("bought %s on %s after %s", service, op_label(operator), failures or "no failures")
 
         now = time.time()
+        paid = meta.get("activationCost")
+        try:
+            paid = float(paid) if paid is not None else None
+        except (TypeError, ValueError):
+            paid = None
+        if paid is None:
+            # Provider didn't say; fall back to the listed price for this option.
+            listed = [p for pid, c, p in stocked_with_counts(service) if pid == operator and p is not None]
+            paid = listed[0] if listed else None
+        sold_by = str(meta.get("activationOperator") or (operator if operator.isdigit() else "")) or None
         act = Activation(
             act_id=act_id,
             phone=phone,
@@ -438,6 +460,8 @@ async def do_buy(
             expires_at=now + ACTIVATION_TTL,
             state=LIVE,
             message_id=status_msg.message_id,
+            operator=sold_by,
+            price=paid,
         )
         store.insert(act)
 

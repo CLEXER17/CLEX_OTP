@@ -31,10 +31,18 @@ CREATE TABLE IF NOT EXISTS activations (
     expires_at  REAL NOT NULL,
     state       TEXT NOT NULL,
     codes       TEXT NOT NULL DEFAULT '[]',
-    note        TEXT
+    note        TEXT,
+    operator    TEXT,
+    price       REAL
 );
 CREATE INDEX IF NOT EXISTS idx_state ON activations(state);
 """
+
+# Columns added after the first release; applied to existing databases.
+MIGRATIONS = (
+    "ALTER TABLE activations ADD COLUMN operator TEXT",
+    "ALTER TABLE activations ADD COLUMN price REAL",
+)
 
 
 @dataclass
@@ -50,6 +58,8 @@ class Activation:
     message_id: int | None = None
     codes: list[str] = field(default_factory=list)
     note: str | None = None
+    operator: str | None = None
+    price: float | None = None
 
     @property
     def seconds_left(self) -> int:
@@ -67,6 +77,11 @@ class Store:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        for stmt in MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already present
         self._conn.commit()
 
     def close(self) -> None:
@@ -86,18 +101,20 @@ class Store:
             state=row["state"],
             codes=json.loads(row["codes"] or "[]"),
             note=row["note"],
+            operator=row["operator"],
+            price=row["price"],
         )
 
     def insert(self, act: Activation) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO activations
                (act_id, phone, service, country, chat_id, message_id,
-                created_at, expires_at, state, codes, note)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at, expires_at, state, codes, note, operator, price)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 act.act_id, act.phone, act.service, act.country, act.chat_id,
                 act.message_id, act.created_at, act.expires_at, act.state,
-                json.dumps(act.codes), act.note,
+                json.dumps(act.codes), act.note, act.operator, act.price,
             ),
         )
         self._conn.commit()

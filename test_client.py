@@ -201,6 +201,22 @@ def test_parse_v3() -> None:
     check("country-wide, missing country", parse_v3_country(full, "1"), None)
 
 
+def test_store_new_columns() -> None:
+    print("store operator/price")
+    with tempfile.TemporaryDirectory() as tmp:
+        st = Store(os.path.join(tmp, "t.db"))
+        act = Activation(act_id="x1", phone="919", service="alr", country="22", chat_id=1,
+                         created_at=1.0, expires_at=2.0, operator="3", price=6.2)
+        st.insert(act)
+        got = st.get("x1")
+        check("operator persists", got.operator, "3")
+        check("price persists", got.price, 6.2)
+        st2 = Store(os.path.join(tmp, "t.db"))  # migrations idempotent
+        check("reopen ok", st2.get("x1").operator, "3")
+        st.close()
+        st2.close()
+
+
 def test_dedup_logic() -> None:
     """The rule the poller uses to decide a code is new."""
     print("\ndedup")
@@ -218,6 +234,7 @@ async def main() -> None:
     await test_setstatus_helpers()
     test_store()
     test_dedup_logic()
+    test_store_new_columns()
     test_parse_v3()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
