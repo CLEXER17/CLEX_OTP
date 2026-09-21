@@ -370,6 +370,37 @@ async def buy_once(
 _TRY_NEXT = ("BAD_SERVICE", "NO_NUMBERS", "BAD_OPERATOR", "WRONG_MAX_PRICE", "ERROR")
 
 
+def failure_reason(codes: list[str], service: str, known: bool) -> str:
+    """One plain sentence for why a purchase failed, from the codes seen."""
+    seen = set(codes)
+    stock = {"NO_NUMBERS"}
+    refused = {"BAD_SERVICE"}
+    if seen and seen <= stock:
+        return "Out of stock right now — every operator that carries it is empty. Try again later."
+    if seen and seen <= refused:
+        return ("Provider refuses to sell this service via API right now." if known
+                else f"Unknown service code. Find it with /services {service}")
+    if seen and seen <= stock | refused:
+        return ("Out of stock: the operators that would sell it are empty, "
+                "and the rest refuse this service.")
+    if "NO_BALANCE" in seen:
+        return "Wallet balance too low for this number. Top up at temporasms.com."
+    if "WRONG_MAX_PRICE" in seen:
+        return f"Price cap rejected. Pass one: /buy {service} PRICE  (see /stock {service})"
+    if "SERVICE_BANNED" in seen:
+        return "Temporarily blocked by the provider for too many requests/cancels. Wait a while."
+    if "TOO_MANY_REQUESTS" in seen:
+        return "Rate limited by the provider. Wait a minute and retry."
+    if seen & {"HTTP_ERROR", "NETWORK_ERROR"}:
+        return "Provider API is unreachable or erroring. Retry shortly."
+    if "BAD_COUNTRY" in seen or "BAD_OPERATOR" in seen:
+        return "Provider rejected the country/operator combination."
+    if "foreign number" in " ".join(codes):
+        return "Only non-Indian numbers were offered; they were refunded."
+    last = codes[-1] if codes else "unknown"
+    return str(TemporaError(last))
+
+
 async def do_buy(
     context, msg, service: str, country: str, max_price: float | None,
     operator: str | list[str] | None = None,
@@ -431,29 +462,18 @@ async def do_buy(
                 if exc.code not in _TRY_NEXT:
                     break
         if act_id is None:
-            last_full = failures[-1].split(": ", 1)[1] if failures else "?"
-            last = last_full.split(" (", 1)[0]
-            hint = ""
-            if last == "WRONG_MAX_PRICE":
-                hint = f"\nPass a cap: /buy {service} PRICE  (see /stock {service})"
-            elif last == "BAD_SERVICE" and len(services) == 1:
-                known = service in await service_names()
-                hint = (
-                    "\nProvider refuses to sell this service via API right now."
-                    if known else f"\nFind the code: /services {service}"
-                )
-            if len(failures) > 1:
-                detail = "\n".join(failures)
-            else:
-                detail = str(TemporaError(last))
-                if " (" in last_full:
-                    detail += " (" + last_full.split(" (", 1)[1]
             names = await service_names()
             if len(services) == 1:
                 label = f"{service} ({names[service]})" if service in names else service
             else:
                 label = f"any of {len(services)} catch-all services"
-            await status_msg.edit_text(f"Could not buy {label}.\n{detail}{hint}")
+            codes = [f.split(": ", 1)[1].split(" (", 1)[0] for f in failures]
+            reason = failure_reason(codes, service, service in names)
+            detail = "\n".join(failures) if len(failures) > 1 else ""
+            body = f"<b>Could not buy {esc(label)}</b>\n{esc(reason)}"
+            if detail:
+                body += f"\n\n<i>{esc(detail)}</i>"
+            await status_msg.edit_text(body, parse_mode=ParseMode.HTML)
             return
         if len(plan) > 1:
             log.info("bought %s on %s after %s", service, op_label(operator), failures or "no failures")
