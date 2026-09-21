@@ -39,11 +39,15 @@ API_ERRORS = {
     "NO_ACTIVATION": "Unknown or already-closed activation id.",
     "EARLY_CANCEL_DENIED": "Too soon after purchase to cancel.",
     "WRONG_ACTIVATION_ID": "Unknown activation id.",
-    # Observed live (2026-09-21): list endpoints return this without ?operator=
+    # From temporasms.com/api-gateway (read 2026-09-21):
     "BAD_OPERATOR": "Unknown or missing operator - see /operators.",
+    "BAD_COUNTRY": "Unknown country code - see /countries.",
+    "WRONG_MAX_PRICE": "maxPrice is invalid (integer, at/above a live price).",
+    "SERVICE_BANNED": "Temporarily blocked for excessive requests/cancellations.",
 }
 
-# setStatus values.
+# setStatus values. TemporaSMS documents only 3 and 8; 1 and 6 are protocol
+# convention and may come back BAD_STATUS - callers tolerate that.
 STATUS_READY = 1      # number is ready / you have triggered the OTP
 STATUS_RETRY = 3      # request another SMS on this same activation
 STATUS_FINISH = 6     # complete the activation (IRREVERSIBLE - releases number)
@@ -253,6 +257,21 @@ class TemporaSMS:
         )
         return self._as_json(body)
 
+    async def get_prices_v3(
+        self,
+        country: str | int,
+        service: str | None = None,
+        operator: str | None = "smart",
+    ) -> Any:
+        """Live price options and stock per provider.
+
+        {country: {service: {price, count, providers: {id: {count, price: [..]}}}}}
+        """
+        body = await self._call(
+            "getPricesV3", country=country, service=service, operator=operator
+        )
+        return self._as_json(body)
+
     async def get_countries(self, operator: str | None = None) -> Any:
         return self._as_json(await self._call("getCountries", operator=operator))
 
@@ -261,3 +280,50 @@ class TemporaSMS:
 
     async def get_operators(self, country: str | int | None = None) -> Any:
         return self._as_json(await self._call("getOperators", country=country))
+
+
+# --------------------------------------------------------------------------
+# stock parsing
+# --------------------------------------------------------------------------
+
+
+def _num(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_v3_providers(
+    data: Any, country: str | int, service: str
+) -> dict[str, tuple[int, list[float]]] | None:
+    """getPricesV3 -> {provider_id: (count, sorted prices)} for one service.
+
+    Returns {} when the country is present but the service has no providers,
+    and None when the payload is not the documented shape.
+    """
+    if not isinstance(data, dict):
+        return None
+    node = data.get(str(country))
+    if not isinstance(node, dict):
+        return None
+    node = node.get(service)
+    if not isinstance(node, dict):
+        return {}
+    providers = node.get("providers")
+    if providers is None:
+        return {}
+    if not isinstance(providers, dict):
+        return None
+
+    out: dict[str, tuple[int, list[float]]] = {}
+    for pid, info in providers.items():
+        if not isinstance(info, dict):
+            continue
+        count = _num(info.get("count"))
+        raw_prices = info.get("price", [])
+        if not isinstance(raw_prices, list):
+            raw_prices = [raw_prices]
+        prices = sorted(p for p in (_num(x) for x in raw_prices) if p is not None)
+        out[str(pid)] = (int(count or 0), prices)
+    return out

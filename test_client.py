@@ -11,7 +11,7 @@ import tempfile
 import time
 
 from store import CANCELLED, LIVE, Activation, Store
-from tempora import API_ERRORS, TemporaError, TemporaSMS
+from tempora import parse_v3_providers, API_ERRORS, TemporaError, TemporaSMS
 
 PASS, FAIL = 0, 0
 
@@ -180,6 +180,22 @@ def test_store() -> None:
     store.close()
 
 
+def test_parse_v3() -> None:
+    print("parse_v3_providers")
+    doc = {"22": {"wa": {"price": 2.99, "count": 467, "providers": {
+        "3": {"count": 467, "price": [2.99], "providerIds": "3"},
+        "7": {"count": "12", "price": [3.5, 2.5]},
+    }}}}
+    check("documented shape", parse_v3_providers(doc, "22", "wa"),
+          {"3": (467, [2.99]), "7": (12, [2.5, 3.5])})
+    check("service absent -> empty", parse_v3_providers(doc, "22", "tg"), {})
+    check("country absent -> None", parse_v3_providers(doc, "1", "wa"), None)
+    check("no providers key -> empty",
+          parse_v3_providers({"22": {"wa": {}}}, "22", "wa"), {})
+    check("not a dict -> None", parse_v3_providers("BAD", "22", "wa"), None)
+    check("int country accepted", parse_v3_providers(doc, 22, "wa") is not None, True)
+
+
 def test_dedup_logic() -> None:
     """The rule the poller uses to decide a code is new."""
     print("\ndedup")
@@ -197,6 +213,7 @@ async def main() -> None:
     await test_setstatus_helpers()
     test_store()
     test_dedup_logic()
+    test_parse_v3()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
 

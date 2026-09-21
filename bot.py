@@ -38,7 +38,7 @@ from telegram.ext import (
 )
 
 from store import CANCELLED, DONE, EXPIRED, LIVE, Activation, Store
-from tempora import TemporaError, TemporaSMS
+from tempora import TemporaError, TemporaSMS, parse_v3_providers
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
@@ -56,10 +56,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 API_KEY = os.environ.get("TEMPORASMS_API_KEY", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 DB_PATH = os.environ.get("DB_PATH", "./bot.db")
-DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "0").strip()
-# Upstream provider id (opaque numeric, see /operators). Live API rejects the
-# smart/cheap/auto/best modes for list endpoints. Switch at runtime with /op N.
-DEFAULT_OPERATOR = os.environ.get("DEFAULT_OPERATOR", "1").strip()
+DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "22").strip()  # 22 = India
+# Operator for every call: a numeric id from /operators, or a routing mode.
+# "smart" is the only mode documented for the list endpoints ("auto" is
+# rejected there), so it is the default. Switch at runtime with /op.
+OPERATOR_MODES = ("smart", "auto", "cheap", "best")
+DEFAULT_OPERATOR = os.environ.get("DEFAULT_OPERATOR", "smart").strip()
 current_operator = DEFAULT_OPERATOR
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 # Activation window in seconds. 20 min is the protocol convention - confirm
@@ -191,11 +193,12 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) ->
 HELP = """<b>TemporaSMS bot</b>
 
 <code>/buy SERVICE COUNTRY [MAXPRICE]</code>
-  buy a number, e.g. <code>/buy wa 0</code>
+  buy a number, e.g. <code>/buy wa 22</code>
 <code>/active</code>   live activations
 <code>/recent</code>   last 15 activations
 <code>/balance</code>  wallet balance
 <code>/price SERVICE [COUNTRY]</code>
+<code>/stock SERVICE [COUNTRY]</code>  stock per operator, best first
 <code>/op [N]</code> · <code>/operators [COUNTRY]</code> · <code>/countries</code> · <code>/services</code>
 <code>/stats</code>    local counters
 
@@ -232,7 +235,7 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args:
         await msg.reply_text(
-            "Usage: /buy SERVICE COUNTRY [MAXPRICE]\nExample: /buy wa 0"
+            "Usage: /buy SERVICE COUNTRY [MAXPRICE]\nExample: /buy wa 22"
         )
         return
 
@@ -348,10 +351,13 @@ async def cmd_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Current operator: {current_operator}\nUsage: /op N  (ids from /operators)"
         )
         return
-    if not args[0].isdigit():
-        await update.effective_message.reply_text("Operator must be a numeric id.")
+    choice = args[0].lower()
+    if not (choice.isdigit() or choice in OPERATOR_MODES):
+        await update.effective_message.reply_text(
+            "Operator must be a numeric id or one of: " + ", ".join(OPERATOR_MODES)
+        )
         return
-    current_operator = args[0]
+    current_operator = choice
     await update.effective_message.reply_text(f"Operator set to {current_operator}.")
 
 
@@ -400,6 +406,78 @@ async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(
         f"<pre>{esc(text[:3500])}</pre>", parse_mode=ParseMode.HTML
     )
+
+
+@admin_only
+async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stock per operator for one service/country, best first.
+
+    getPricesV3 with a numeric operator reports that operator's providers.
+    Sweeping every id from /operators and merging by provider id gives the
+    full picture whatever each call chooses to include.
+    """
+    msg = update.effective_message
+    args = context.args or []
+    if not args:
+        await msg.reply_text("Usage: /stock SERVICE [COUNTRY]\nExample: /stock wa 22")
+        return
+    service = args[0]
+    country = args[1] if len(args) > 1 else DEFAULT_COUNTRY
+
+    try:
+        ops = await api.get_operators(country=country)
+    except TemporaError as exc:
+        await msg.reply_text(f"Error listing operators: {exc}")
+        return
+    values = ops.values() if isinstance(ops, dict) else ops
+    op_ids = sorted({str(v) for v in values if str(v).isdigit()}, key=int)
+    if not op_ids:
+        await msg.reply_text("No operators returned.")
+        return
+
+    status = await msg.reply_text(f"Checking {len(op_ids)} operators…")
+    merged: dict[str, tuple[int, list[float]]] = {}
+    errors: list[str] = []
+    unparsed: str | None = None
+    for op in op_ids:
+        try:
+            data = await api.get_prices_v3(country, service=service, operator=op)
+        except TemporaError as exc:
+            if exc.code == "TOO_MANY_REQUESTS":
+                errors.append(f"{op}: rate limited, stopped")
+                break
+            errors.append(f"{op}: {exc.code}")
+            continue
+        found = parse_v3_providers(data, country, service)
+        if found is None:
+            if unparsed is None:
+                unparsed = str(data)[:300]
+            continue
+        for pid, (count, prices) in found.items():
+            prev = merged.get(pid)
+            if prev is None or count > prev[0]:
+                merged[pid] = (count, prices)
+        merged.setdefault(op, (0, []))
+
+    def order(item):
+        pid, (count, prices) = item
+        return (-count, prices[0] if prices else 1e9, int(pid) if pid.isdigit() else 0)
+
+    lines = [f"<b>{esc(service)} · country {esc(country)}</b>", ""]
+    for pid, (count, prices) in sorted(merged.items(), key=order):
+        if count:
+            price = " @ " + " / ".join(f"{p:g}" for p in prices) if prices else ""
+            lines.append(f"op <b>{esc(pid)}</b>: {count}{esc(price)}")
+        else:
+            lines.append(f"op {esc(pid)}: —")
+    total = sum(c for c, _ in merged.values())
+    lines += ["", f"total <b>{total}</b> · current operator: {esc(current_operator)}"]
+    if errors:
+        lines += ["", "<i>" + esc("; ".join(errors)) + "</i>"]
+    if unparsed:
+        lines += ["", "<i>unexpected shape:</i>", f"<pre>{esc(unparsed)}</pre>"]
+    lines += ["", "buy from one: <code>/op N</code> then <code>/buy SERVICE COUNTRY</code>"]
+    await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -607,6 +685,7 @@ def main() -> None:
     app.add_handler(CommandHandler("operators", cmd_operators))
     app.add_handler(CommandHandler("countries", cmd_countries))
     app.add_handler(CommandHandler("services", cmd_services))
+    app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
