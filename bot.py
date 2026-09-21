@@ -356,8 +356,8 @@ async def do_buy(context, msg, service: str, country: str, max_price: float | No
 
 _any_service: str = ANY_SERVICE
 _ANY_PATTERNS = (
-    r"^any$", r"^other$", r"^any other", r"^all$", r"^all services",
-    r"^full$", r"\bany app\b", r"\bother\b", r"\bany\b", r"\ball\b",
+    r"^any$", r"^other$", r"^any other", r"^any service", r"^any app",
+    r"^other service", r"^all$", r"^all service", r"^universal",
 )
 
 
