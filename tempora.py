@@ -55,7 +55,11 @@ class TemporaError(RuntimeError):
         self.code = code
         self.raw = raw
         detail = API_ERRORS.get(code, "")
-        super().__init__(f"{code} - {detail}" if detail else code)
+        msg = f"{code} - {detail}" if detail else code
+        # Transport/parse failures carry no documented meaning; surface the body.
+        if raw and code in ("BAD_JSON", "HTTP_ERROR", "NETWORK_ERROR", "EMPTY_RESPONSE"):
+            msg = f"{msg}: {raw[:300]}"
+        super().__init__(msg)
 
 
 @dataclass(frozen=True)
@@ -151,8 +155,9 @@ class TemporaSMS:
     @staticmethod
     def _as_json(body: str) -> Any:
         try:
-            return json.loads(body)
+            return json.loads(body.lstrip("﻿"))
         except json.JSONDecodeError as exc:
+            log.warning("non-JSON body (%d bytes): %r", len(body), body[:400])
             raise TemporaError("BAD_JSON", body[:400]) from exc
 
     # ------------------------------------------------------------------
