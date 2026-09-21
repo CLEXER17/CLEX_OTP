@@ -331,7 +331,15 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("MAXPRICE must be a number.")
             return
 
-    await do_buy(context, msg, service, country, max_price)
+    candidates: list[str] = []
+    if not current_operator.isdigit():
+        try:
+            await sweep_stock(country, max_age=STOCK_CACHE_TTL)
+        except TemporaError:
+            pass
+        candidates = stocked_operators(service)
+    candidates += [m for m in (current_operator, "smart") if m not in candidates]
+    await do_buy(context, msg, service, country, max_price, candidates)
 
 
 def op_label(operator: str) -> str:
@@ -762,19 +770,33 @@ async def live_max_price(service: str, country: str, operator: str) -> int | Non
     Multi-price operators refuse getNumber without maxPrice (WRONG_MAX_PRICE);
     the cap is the largest live option so any of them can be reserved.
     """
-    providers: dict = {}
-    cached = _stock_cache.get("merged", {}).get(service) if _stock_cache.get("country") == country else None
-    if cached:
-        providers = cached if not operator.isdigit() else {operator: cached.get(operator, (0, []))}
-    if not providers or not any(ps for _, ps in providers.values()):
-        # Routing modes return nothing useful from getPricesV3; ask a real id.
-        lookup_op = operator if operator.isdigit() else list_operator()
+    def from_cache() -> dict:
+        if _stock_cache.get("country") != country:
+            return {}
+        cached = _stock_cache.get("merged", {}).get(service) or {}
+        if operator.isdigit():
+            return {operator: cached[operator]} if operator in cached else {}
+        return cached
+
+    def has_prices(p: dict) -> bool:
+        return any(ps for _, ps in p.values())
+
+    providers = from_cache()
+    if not has_prices(providers) and operator.isdigit():
+        # Cheap targeted lookup for one operator.
         try:
-            data = await api.get_prices_v3(country, service=service, operator=lookup_op)
+            data = await api.get_prices_v3(country, service=service, operator=operator)
+            providers = parse_v3_providers(data, country, service) or {}
         except TemporaError as exc:
-            log.info("price lookup for %s/%s failed: %s", service, lookup_op, exc)
-            return None
-        providers = parse_v3_providers(data, country, service) or {}
+            log.info("price lookup for %s/%s failed: %s", service, operator, exc)
+    if not has_prices(providers):
+        # Routing modes (or a cold cache): sweep every operator, then read
+        # the highest price across whoever carries the service.
+        try:
+            await sweep_stock(country, max_age=STOCK_CACHE_TTL)
+        except TemporaError as exc:
+            log.info("sweep for cap on %s failed: %s", service, exc)
+        providers = from_cache()
     prices = [p for _, ps in providers.values() for p in ps]
     return math.ceil(max(prices)) if prices else None
 
@@ -1119,6 +1141,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if op:
             candidates: list[str] = [op]
         else:
+            try:
+                await sweep_stock(DEFAULT_COUNTRY, max_age=STOCK_CACHE_TTL)
+            except TemporaError:
+                pass
             candidates = stocked_operators(code)
             candidates += [m for m in (current_operator, "smart") if m not in candidates]
         await query.answer(f"Buying {code}" + (f" via op{op}" if op else ""))
