@@ -32,7 +32,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1167,6 +1167,11 @@ async def on_shutdown(app: Application) -> None:
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        # Another instance is polling - normally the previous Railway deploy
+        # still draining. PTB keeps retrying; this clears once it exits.
+        log.warning("Another bot instance is polling (old deploy draining?); retrying")
+        return
     log.exception("Unhandled error", exc_info=context.error)
 
 
