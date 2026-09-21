@@ -35,6 +35,7 @@ multi-user path in this build.
 /buy SERVICE [MAXPRICE]           number for one app, e.g. /buy wa
                                   (COUNTRY arg appears after SERVICE when LOCK_COUNTRY=0)
 /active                           live activations with buttons
+/cancel [ID]                      cancel + refund; queued and retried if the provider says too early
 /recent                           last 15
 /balance                          wallet balance
 /price SERVICE

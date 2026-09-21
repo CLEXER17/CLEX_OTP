@@ -83,6 +83,10 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 # against your account and adjust if TemporaSMS uses a different window.
 ACTIVATION_TTL = int(os.environ.get("ACTIVATION_TTL", "1200"))
 MAX_LIVE = int(os.environ.get("MAX_LIVE", "5"))
+# Providers refuse cancel for the first minutes of an activation. When a
+# cancel is rejected early, retry it automatically once this much time has
+# passed since purchase.
+CANCEL_AFTER = int(os.environ.get("CANCEL_AFTER", "120"))
 
 _missing = [
     name
@@ -228,6 +232,7 @@ HELP = """<b>TemporaSMS bot</b>
 <code>{buy_usage}</code>
   number for one app, e.g. <code>/buy wa</code>
 <code>/active</code>   live activations
+<code>/cancel [ID]</code>  cancel + refund (auto-retries if too early)
 <code>/recent</code>   last 15 activations
 <code>/balance</code>  wallet balance
 <code>/price SERVICE{country_arg}</code>
@@ -241,7 +246,8 @@ HELP = """<b>TemporaSMS bot</b>
 · <b>Another SMS</b> — request a second code on the same number.
   Same service only; a different app needs a new number.
 · <b>Done</b> — releases the number permanently.
-· <b>Cancel</b> — refunds, only before any SMS arrives.
+· <b>Cancel</b> — refunds, only before any SMS arrives. If the provider
+  says it is too early, the bot waits and cancels for you.
 
 Nothing is auto-released after the first code, so the number stays
 yours for the whole window.{lock_note}"""
@@ -419,6 +425,31 @@ async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price)
+
+
+@admin_only
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel [ID] - cancel one live activation (the only one, if ID omitted)."""
+    msg = update.effective_message
+    args = context.args or []
+    live = store.live()
+    if args:
+        act = store.get(args[0])
+    elif len(live) == 1:
+        act = live[0]
+    else:
+        await msg.reply_text("Usage: /cancel ID  (ids in /active)")
+        return
+    if not act or act.state != LIVE:
+        await msg.reply_text("No such live activation.")
+        return
+    result = await try_cancel(context, act)
+    replies = {
+        "ok": "Cancelled and refunded.",
+        "queued": f"Too early — queued, cancels itself {CANCEL_AFTER}s after purchase.",
+        "HAS_CODE": "A code already arrived; cancel is refused. Use Done.",
+    }
+    await msg.reply_text(replies.get(result, f"Cancel rejected: {result}"))
 
 
 @admin_only
@@ -686,6 +717,76 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------
+# cancel
+# --------------------------------------------------------------------------
+
+_EARLY_CANCEL = ("EARLY_CANCEL_DENIED", "BAD_STATUS", "ERROR")
+
+
+CANCEL_RETRY_EVERY = 30   # seconds between retries once CANCEL_AFTER has passed
+CANCEL_RETRIES = 6        # give up after this many post-window retries
+
+
+async def try_cancel(
+    context: ContextTypes.DEFAULT_TYPE, act: Activation, attempt: int = 0
+) -> str:
+    """Cancel + refund. Returns 'ok', 'queued', or the rejection code.
+
+    Always tries immediately. If the provider rejects it as too early, a
+    one-shot job retries when CANCEL_AFTER has passed, then every
+    CANCEL_RETRY_EVERY seconds up to CANCEL_RETRIES times.
+    """
+    if act.codes:
+        return "HAS_CODE"
+    try:
+        await api.cancel(act.act_id)
+    except TemporaError as exc:
+        elapsed = time.time() - act.created_at
+        wait = CANCEL_AFTER - elapsed
+        if exc.code in _EARLY_CANCEL and (wait > 0 or attempt < CANCEL_RETRIES):
+            delay = wait + 2 if wait > 0 else CANCEL_RETRY_EVERY
+            act.note = f"cancel queued — retrying in {int(delay)}s ({exc.code})"
+            store.update(act)
+            await refresh_card(context, act)
+            context.job_queue.run_once(
+                cancel_job, when=delay,
+                data={"id": act.act_id, "attempt": attempt + (wait <= 0)},
+                name=f"cancel:{act.act_id}",
+            )
+            return "queued"
+        act.note = f"cancel rejected: {exc}"
+        store.update(act)
+        await refresh_card(context, act)
+        return exc.code
+    act.state = CANCELLED
+    act.note = "cancelled, refund requested"
+    store.update(act)
+    await refresh_card(context, act)
+    return "ok"
+
+
+async def cancel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    act = store.get(data["id"])
+    if not act or act.state != LIVE:
+        return
+    if act.codes:
+        act.note = "cancel dropped — a code arrived meanwhile"
+        store.update(act)
+        await refresh_card(context, act)
+        return
+    result = await try_cancel(context, act, attempt=data["attempt"])
+    if result == "queued":
+        return
+    text = ("cancelled and refunded" if result == "ok"
+            else f"cancel failed: {result}")
+    await notify(
+        context, act.chat_id,
+        f"<code>{esc(act.act_id)}</code> ({esc(act.phone)}): {esc(text)}",
+    )
+
+
+# --------------------------------------------------------------------------
 # buttons
 # --------------------------------------------------------------------------
 
@@ -753,19 +854,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 show_alert=True,
             )
             return
-        try:
-            await api.cancel(act.act_id)
-        except TemporaError as exc:
-            await query.answer(f"Cancel rejected: {exc.code}", show_alert=True)
-            act.note = f"cancel rejected: {exc}"
-            store.update(act)
-            await refresh_card(context, act)
-            return
-        act.state = CANCELLED
-        act.note = "cancelled, refund requested"
-        store.update(act)
-        await query.answer("Cancelled and refunded.")
-        await refresh_card(context, act)
+        result = await try_cancel(context, act)
+        if result == "ok":
+            await query.answer("Cancelled and refunded.")
+        elif result == "queued":
+            await query.answer(
+                f"Too early — provider allows cancel {CANCEL_AFTER}s after purchase. "
+                "Queued; it will cancel itself.",
+                show_alert=True,
+            )
+        else:
+            await query.answer(f"Cancel rejected: {result}", show_alert=True)
         return
 
     await query.answer("Unknown action.")
@@ -874,6 +973,7 @@ def main() -> None:
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler(["number", "num", "get"], cmd_number))
     app.add_handler(CommandHandler("any", cmd_any))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("active", cmd_active))
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CommandHandler("price", cmd_price))
