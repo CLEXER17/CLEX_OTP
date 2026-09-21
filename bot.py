@@ -955,6 +955,27 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @admin_only
+async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/raw CODE [OP] - untouched getPricesV3 JSON, to see fields we don't parse."""
+    import json
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text("Usage: /raw CODE [OP]   e.g. /raw alr 3")
+        return
+    code = args[0]
+    op = args[1] if len(args) > 1 else list_operator()
+    try:
+        data = await api.get_prices_v3(DEFAULT_COUNTRY, service=code, operator=op)
+    except TemporaError as exc:
+        await update.effective_message.reply_text(f"Error: {exc}")
+        return
+    text = json.dumps(data, indent=1, ensure_ascii=False)
+    await update.effective_message.reply_text(
+        f"<pre>{esc(text[:3800])}</pre>", parse_mode=ParseMode.HTML
+    )
+
+
+@admin_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = store.stats()
     lines = ["<b>Local counters</b>", ""]
@@ -1268,6 +1289,7 @@ def main() -> None:
     app.add_handler(CommandHandler("countries", cmd_countries))
     app.add_handler(CommandHandler("services", cmd_services))
     app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("raw", cmd_raw))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu))
