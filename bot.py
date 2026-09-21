@@ -64,6 +64,10 @@ DB_PATH = os.environ.get("DB_PATH", "./bot.db")
 DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "22").strip()  # 22 = India
 # When locked, commands take no COUNTRY argument and always use DEFAULT_COUNTRY.
 LOCK_COUNTRY = os.environ.get("LOCK_COUNTRY", "1").strip().lower() in ("1", "true", "yes")
+# A bought number must start with this dialling code or it is cancelled for
+# refund and the next operator is tried. Catch-all pools sometimes hand out
+# numbers from the wrong country despite country=22.
+NUMBER_PREFIX = os.environ.get("NUMBER_PREFIX", "91" if DEFAULT_COUNTRY == "22" else "").strip()
 # Operator for every call: a numeric id from /operators, or a routing mode.
 # "smart" is the only mode documented for the list endpoints ("auto" is
 # rejected there), so it is the default. Switch at runtime with /op.
@@ -377,6 +381,18 @@ async def do_buy(
                 await status_msg.edit_text(f"Buying {where}…")
             try:
                 act_id, phone = await buy_once(status_msg, service, country, operator, cap)
+                digits = phone.lstrip("+")
+                if NUMBER_PREFIX and not digits.startswith(NUMBER_PREFIX):
+                    # Wrong country - give it back and keep looking.
+                    try:
+                        await api.cancel(act_id)
+                        outcome = "cancelled"
+                    except TemporaError as cexc:
+                        outcome = f"cancel failed: {cexc.code}"
+                    log.warning("non-%s number %s from %s (%s)", NUMBER_PREFIX, phone, op_label(operator), outcome)
+                    failures.append(f"{op_label(operator)}: foreign number {phone} ({outcome})")
+                    act_id = phone = None
+                    continue
                 break
             except TemporaError as exc:
                 tag = f"{service} {op_label(operator)}" if len(services) > 1 else op_label(operator)
