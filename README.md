@@ -30,14 +30,15 @@ multi-user path in this build.
 ## Commands
 
 ```
-/buy SERVICE COUNTRY [MAXPRICE]   buy a number, e.g. /buy wa 22
+/buy SERVICE [MAXPRICE]           buy a number, e.g. /buy wa
+                                  (COUNTRY arg appears after SERVICE when LOCK_COUNTRY=0)
 /active                           live activations with buttons
 /recent                           last 15
 /balance                          wallet balance
-/price SERVICE [COUNTRY]
-/stock SERVICE [COUNTRY]          sweep all operators, rank by available stock
+/price SERVICE
+/stock SERVICE                    sweep all operators, rank by available stock
 /op [N|smart|auto|cheap|best]     show or switch the active operator
-/operators [COUNTRY]              list upstream operator ids
+/operators                        list upstream operator ids
 /countries
 /services [filter]                filter is a substring match
 /stats

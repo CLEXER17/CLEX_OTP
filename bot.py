@@ -57,6 +57,8 @@ API_KEY = os.environ.get("TEMPORASMS_API_KEY", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 DB_PATH = os.environ.get("DB_PATH", "./bot.db")
 DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "22").strip()  # 22 = India
+# When locked, commands take no COUNTRY argument and always use DEFAULT_COUNTRY.
+LOCK_COUNTRY = os.environ.get("LOCK_COUNTRY", "1").strip().lower() in ("1", "true", "yes")
 # Operator for every call: a numeric id from /operators, or a routing mode.
 # "smart" is the only mode documented for the list endpoints ("auto" is
 # rejected there), so it is the default. Switch at runtime with /op.
@@ -114,6 +116,23 @@ def esc(value: object) -> str:
 
 def fmt_left(seconds: int) -> str:
     return f"{seconds // 60}m {seconds % 60:02d}s"
+
+
+def split_country(args: list[str]) -> tuple[str, list[str]]:
+    """(country, remaining args) for a command whose first arg is SERVICE.
+
+    Locked: country is fixed and args[1:] are the rest. Unlocked: args[1] is
+    the country when present.
+    """
+    if LOCK_COUNTRY:
+        return DEFAULT_COUNTRY, args[1:]
+    if len(args) > 1:
+        return args[1], args[2:]
+    return DEFAULT_COUNTRY, []
+
+
+COUNTRY_ARG = "" if LOCK_COUNTRY else " [COUNTRY]"
+BUY_USAGE = f"/buy SERVICE{'' if LOCK_COUNTRY else ' COUNTRY'} [MAXPRICE]"
 
 
 def keyboard(act: Activation) -> InlineKeyboardMarkup | None:
@@ -192,14 +211,14 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) ->
 
 HELP = """<b>TemporaSMS bot</b>
 
-<code>/buy SERVICE COUNTRY [MAXPRICE]</code>
-  buy a number, e.g. <code>/buy wa 22</code>
+<code>{buy_usage}</code>
+  buy a number, e.g. <code>/buy wa</code>
 <code>/active</code>   live activations
 <code>/recent</code>   last 15 activations
 <code>/balance</code>  wallet balance
-<code>/price SERVICE [COUNTRY]</code>
-<code>/stock SERVICE [COUNTRY]</code>  stock per operator, best first
-<code>/op [N]</code> · <code>/operators [COUNTRY]</code> · <code>/countries</code> · <code>/services</code>
+<code>/price SERVICE{country_arg}</code>
+<code>/stock SERVICE{country_arg}</code>  stock per operator, best first
+<code>/op [N]</code> · <code>/operators</code> · <code>/countries</code> · <code>/services</code>
 <code>/stats</code>    local counters
 
 <b>On each activation</b>
@@ -209,7 +228,13 @@ HELP = """<b>TemporaSMS bot</b>
 · <b>Cancel</b> — refunds, only before any SMS arrives.
 
 Nothing is auto-released after the first code, so the number stays
-yours for the whole window."""
+yours for the whole window.{lock_note}"""
+
+HELP = HELP.format(
+    buy_usage=BUY_USAGE,
+    country_arg=COUNTRY_ARG,
+    lock_note=f"\n\nCountry is locked to {DEFAULT_COUNTRY}." if LOCK_COUNTRY else "",
+)
 
 
 @admin_only
@@ -234,17 +259,15 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     args = context.args or []
     if not args:
-        await msg.reply_text(
-            "Usage: /buy SERVICE COUNTRY [MAXPRICE]\nExample: /buy wa 22"
-        )
+        await msg.reply_text(f"Usage: {BUY_USAGE}\nExample: /buy wa")
         return
 
     service = args[0]
-    country = args[1] if len(args) > 1 else DEFAULT_COUNTRY
+    country, rest = split_country(args)
     max_price = None
-    if len(args) > 2:
+    if rest:
         try:
-            max_price = float(args[2])
+            max_price = float(rest[0])
         except ValueError:
             await msg.reply_text("MAXPRICE must be a number.")
             return
@@ -326,10 +349,10 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args:
-        await update.effective_message.reply_text("Usage: /price SERVICE [COUNTRY]")
+        await update.effective_message.reply_text(f"Usage: /price SERVICE{COUNTRY_ARG}")
         return
     service = args[0]
-    country = args[1] if len(args) > 1 else DEFAULT_COUNTRY
+    country, _ = split_country(args)
     try:
         data = await api.get_prices(
             service=service, country=country, operator=current_operator
@@ -363,15 +386,13 @@ async def cmd_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @admin_only
 async def cmd_operators(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args or []
-    country = args[0] if args else DEFAULT_COUNTRY
     try:
-        data = await api.get_operators(country=country)
+        data = await api.get_operators()
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
         return
     await update.effective_message.reply_text(
-        f"Operators for country {country} (current: {current_operator}):\n"
+        f"Operators (current: {current_operator}):\n"
         f"<pre>{esc(str(data)[:3400])}</pre>",
         parse_mode=ParseMode.HTML,
     )
@@ -419,13 +440,13 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     args = context.args or []
     if not args:
-        await msg.reply_text("Usage: /stock SERVICE [COUNTRY]\nExample: /stock wa 22")
+        await msg.reply_text(f"Usage: /stock SERVICE{COUNTRY_ARG}\nExample: /stock wa")
         return
     service = args[0]
-    country = args[1] if len(args) > 1 else DEFAULT_COUNTRY
+    country, _ = split_country(args)
 
     try:
-        ops = await api.get_operators(country=country)
+        ops = await api.get_operators()
     except TemporaError as exc:
         await msg.reply_text(f"Error listing operators: {exc}")
         return
@@ -476,7 +497,7 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines += ["", "<i>" + esc("; ".join(errors)) + "</i>"]
     if unparsed:
         lines += ["", "<i>unexpected shape:</i>", f"<pre>{esc(unparsed)}</pre>"]
-    lines += ["", "buy from one: <code>/op N</code> then <code>/buy SERVICE COUNTRY</code>"]
+    lines += ["", f"buy from one: <code>/op N</code> then <code>/buy {esc(service)}</code>"]
     await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
