@@ -35,6 +35,7 @@ multi-user path in this build.
 /recent                           last 15
 /balance                          wallet balance
 /price SERVICE [COUNTRY]
+/operators [COUNTRY]              upstream providers; set DEFAULT_OPERATOR
 /countries
 /services [filter]                filter is a substring match
 /stats

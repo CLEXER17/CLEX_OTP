@@ -39,6 +39,8 @@ API_ERRORS = {
     "NO_ACTIVATION": "Unknown or already-closed activation id.",
     "EARLY_CANCEL_DENIED": "Too soon after purchase to cancel.",
     "WRONG_ACTIVATION_ID": "Unknown activation id.",
+    # Observed live (2026-09-21): list endpoints return this without ?operator=
+    "BAD_OPERATOR": "Unknown or missing operator - see /operators.",
 }
 
 # setStatus values.
@@ -244,15 +246,18 @@ class TemporaSMS:
         self,
         service: str | None = None,
         country: str | int | None = None,
+        operator: str | None = None,
     ) -> Any:
-        body = await self._call("getPrices", service=service, country=country)
+        body = await self._call(
+            "getPrices", service=service, country=country, operator=operator
+        )
         return self._as_json(body)
 
-    async def get_countries(self) -> Any:
-        return self._as_json(await self._call("getCountries"))
+    async def get_countries(self, operator: str | None = None) -> Any:
+        return self._as_json(await self._call("getCountries", operator=operator))
 
-    async def get_services(self) -> Any:
-        return self._as_json(await self._call("getServices"))
+    async def get_services(self, operator: str | None = None) -> Any:
+        return self._as_json(await self._call("getServices", operator=operator))
 
     async def get_operators(self, country: str | int | None = None) -> Any:
         return self._as_json(await self._call("getOperators", country=country))
