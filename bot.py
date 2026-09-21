@@ -312,12 +312,41 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await do_buy(context, msg, service, country, max_price)
 
 
+def op_label(operator: str) -> str:
+    return f"op{operator}" if operator.isdigit() else operator
+
+
+async def buy_once(
+    status_msg, service: str, country: str, operator: str, cap: int | None
+) -> tuple[str, str]:
+    """One getNumber, auto-filling the price cap for multi-price operators."""
+    try:
+        return await api.get_number(service, country, operator=operator, max_price=cap)
+    except TemporaError as exc:
+        if exc.code != "WRONG_MAX_PRICE" or cap is not None:
+            raise
+        cap = await live_max_price(service, country, operator)
+        if cap is None:
+            raise
+        await status_msg.edit_text(f"Buying via {op_label(operator)}… (multi-price, cap {cap})")
+        return await api.get_number(service, country, operator=operator, max_price=cap)
+
+
+# Rejections that mean "not from this operator" - worth trying the next one.
+_TRY_NEXT = ("BAD_SERVICE", "NO_NUMBERS", "BAD_OPERATOR", "WRONG_MAX_PRICE", "ERROR")
+
+
 async def do_buy(
     context, msg, service: str, country: str, max_price: float | None,
-    operator: str | None = None,
+    operator: str | list[str] | None = None,
 ) -> None:
-    """Buy one activation and post its card. Shared by /buy, /number, buttons."""
-    operator = operator or current_operator
+    """Buy one activation and post its card. Shared by /buy, /number, buttons.
+
+    `operator` may be a list: each is tried in turn until one sells.
+    """
+    candidates = [operator] if isinstance(operator, str) else list(operator or [])
+    if not candidates:
+        candidates = [current_operator]
     async with buy_lock:
         live = store.live()
         if len(live) >= MAX_LIVE:
@@ -330,29 +359,32 @@ async def do_buy(
         status_msg = await msg.reply_text("Buying…")
         # The API wants an integer cap; round a fractional one up.
         cap = math.ceil(max_price) if max_price is not None else None
-        try:
+        failures: list[str] = []
+        act_id = phone = None
+        for operator in candidates:
+            if len(candidates) > 1:
+                await status_msg.edit_text(f"Buying via {op_label(operator)}…")
             try:
-                act_id, phone = await api.get_number(
-                    service, country, operator=operator, max_price=cap
-                )
+                act_id, phone = await buy_once(status_msg, service, country, operator, cap)
+                break
             except TemporaError as exc:
-                if exc.code != "WRONG_MAX_PRICE" or cap is not None:
-                    raise
-                cap = await live_max_price(service, country, operator)
-                if cap is None:
-                    raise
-                await status_msg.edit_text(f"Buying… (multi-price operator, cap {cap})")
-                act_id, phone = await api.get_number(
-                    service, country, operator=operator, max_price=cap
-                )
-        except TemporaError as exc:
+                failures.append(f"{op_label(operator)}: {exc.code}")
+                if exc.code not in _TRY_NEXT:
+                    break
+        if act_id is None:
+            last = failures[-1].split(": ", 1)[1] if failures else "?"
             hint = ""
-            if exc.code == "WRONG_MAX_PRICE":
+            if last == "WRONG_MAX_PRICE":
                 hint = f"\nPass a cap: /buy {service} PRICE  (see /stock {service})"
-            elif exc.code == "BAD_SERVICE":
+            elif last == "BAD_SERVICE":
                 hint = f"\nFind the code: /services {service}"
-            await status_msg.edit_text(f"Could not buy a number.\n{exc}{hint}")
+            detail = "\n".join(failures) if len(failures) > 1 else str(
+                TemporaError(last)
+            )
+            await status_msg.edit_text(f"Could not buy a number.\n{detail}{hint}")
             return
+        if len(candidates) > 1:
+            log.info("bought %s on %s after %s", service, op_label(operator), failures or "no failures")
 
         now = time.time()
         act = Activation(
@@ -445,26 +477,28 @@ async def cmd_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     names = await service_names()
     label = f"{code} ({names.get(code, 'unnamed')})"
-    # Route to the operator that actually holds stock for this service.
-    operator = None
+    # Try every operator that shows stock, most first, then the router modes.
+    operators: list[str] = []
     try:
         merged, _ = await sweep_stock(DEFAULT_COUNTRY, max_age=STOCK_CACHE_TTL)
-        best = best_operator(merged.get(code, {}))
-        if best:
-            operator, count, price = best
-            await msg.reply_text(
-                f"{label}: op{operator} has {count} @ {price:g}" if price is not None
-                else f"{label}: op{operator} has {count}"
+        stocked = sorted(
+            ((pid, c, ps[0] if ps else None) for pid, (c, ps) in merged.get(code, {}).items() if c),
+            key=lambda t: -t[1],
+        )
+        operators = [pid for pid, _, _ in stocked]
+        if stocked:
+            summary = ", ".join(
+                f"op{pid} {c}" + (f"@{p:g}" if p is not None else "") for pid, c, p in stocked[:5]
             )
+            await msg.reply_text(f"{label}: {summary}")
         else:
             await msg.reply_text(
-                f"No operator has stock for {label} right now. "
-                "Check /stock or change it with /any CODE."
+                f"No operator lists stock for {label} right now; trying the router anyway."
             )
-            return
     except TemporaError as exc:
         log.info("stock lookup for /number failed: %s", exc)
-    await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price, operator)
+    operators += [m for m in ("smart", "best") if m not in operators]
+    await do_buy(context, msg, code, DEFAULT_COUNTRY, max_price, operators)
 
 
 @admin_only
@@ -762,8 +796,9 @@ def render_stock_page(page: int, names: dict[str, str]) -> tuple[str, InlineKeyb
         for code, providers in chunk:
             if not sum(c for c, _ in providers.values()):
                 continue
-            short = (names.get(code) or code)[:14]
-            row.append(InlineKeyboardButton(f"Buy {short}", callback_data=f"buy:{code}:"))
+            name = names.get(code)
+            label = f"{name[:12]} ({code})" if name else code
+            row.append(InlineKeyboardButton(label, callback_data=f"buy:{code}:"))
             if len(row) == 2:
                 buttons.append(row); row = []
     if row:
@@ -827,7 +862,8 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         picked = {c: p for c, p in merged.items() if sum(x for x, _ in p.values())}
         title = "all services with stock"
 
-    ranked = sorted(picked.items(), key=lambda kv: -sum(c for c, _ in kv[1].values()))
+    # Alphabetical by display name (code when unnamed), so paging is browsable.
+    ranked = sorted(picked.items(), key=lambda kv: (names.get(kv[0], kv[0]).lower(), kv[0]))
     _stock_view.clear()
     _stock_view.update(title=title, ranked=ranked, single=len(ranked) == 1, errors=errors)
     text, markup = render_stock_page(0, names)
