@@ -57,8 +57,10 @@ API_KEY = os.environ.get("TEMPORASMS_API_KEY", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 DB_PATH = os.environ.get("DB_PATH", "./bot.db")
 DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "0").strip()
-# Upstream provider selector; numeric id from /operators or smart/cheap/auto/best.
-DEFAULT_OPERATOR = os.environ.get("DEFAULT_OPERATOR", "auto").strip() or None
+# Upstream provider id (opaque numeric, see /operators). Live API rejects the
+# smart/cheap/auto/best modes for list endpoints. Switch at runtime with /op N.
+DEFAULT_OPERATOR = os.environ.get("DEFAULT_OPERATOR", "1").strip()
+current_operator = DEFAULT_OPERATOR
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 # Activation window in seconds. 20 min is the protocol convention - confirm
 # against your account and adjust if TemporaSMS uses a different window.
@@ -194,7 +196,7 @@ HELP = """<b>TemporaSMS bot</b>
 <code>/recent</code>   last 15 activations
 <code>/balance</code>  wallet balance
 <code>/price SERVICE [COUNTRY]</code>
-<code>/operators [COUNTRY]</code> · <code>/countries</code> · <code>/services</code>
+<code>/op [N]</code> · <code>/operators [COUNTRY]</code> · <code>/countries</code> · <code>/services</code>
 <code>/stats</code>    local counters
 
 <b>On each activation</b>
@@ -256,7 +258,7 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status_msg = await msg.reply_text("Buying…")
         try:
             act_id, phone = await api.get_number(
-                service, country, operator=DEFAULT_OPERATOR, max_price=max_price
+                service, country, operator=current_operator, max_price=max_price
             )
         except TemporaError as exc:
             await status_msg.edit_text(f"Could not buy a number.\n{exc}")
@@ -327,7 +329,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     country = args[1] if len(args) > 1 else DEFAULT_COUNTRY
     try:
         data = await api.get_prices(
-            service=service, country=country, operator=DEFAULT_OPERATOR
+            service=service, country=country, operator=current_operator
         )
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
@@ -335,6 +337,22 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         f"<pre>{esc(str(data)[:3500])}</pre>", parse_mode=ParseMode.HTML
     )
+
+
+@admin_only
+async def cmd_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global current_operator
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            f"Current operator: {current_operator}\nUsage: /op N  (ids from /operators)"
+        )
+        return
+    if not args[0].isdigit():
+        await update.effective_message.reply_text("Operator must be a numeric id.")
+        return
+    current_operator = args[0]
+    await update.effective_message.reply_text(f"Operator set to {current_operator}.")
 
 
 @admin_only
@@ -347,7 +365,7 @@ async def cmd_operators(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text(f"Error: {exc}")
         return
     await update.effective_message.reply_text(
-        f"Operators for country {country} (current: {DEFAULT_OPERATOR}):\n"
+        f"Operators for country {country} (current: {current_operator}):\n"
         f"<pre>{esc(str(data)[:3400])}</pre>",
         parse_mode=ParseMode.HTML,
     )
@@ -356,7 +374,7 @@ async def cmd_operators(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @admin_only
 async def cmd_countries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        data = await api.get_countries(operator=DEFAULT_OPERATOR)
+        data = await api.get_countries(operator=current_operator)
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
         return
@@ -369,7 +387,7 @@ async def cmd_countries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     try:
-        data = await api.get_services(operator=DEFAULT_OPERATOR)
+        data = await api.get_services(operator=current_operator)
     except TemporaError as exc:
         await update.effective_message.reply_text(f"Error: {exc}")
         return
@@ -585,6 +603,7 @@ def main() -> None:
     app.add_handler(CommandHandler("active", cmd_active))
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CommandHandler("price", cmd_price))
+    app.add_handler(CommandHandler("op", cmd_op))
     app.add_handler(CommandHandler("operators", cmd_operators))
     app.add_handler(CommandHandler("countries", cmd_countries))
     app.add_handler(CommandHandler("services", cmd_services))

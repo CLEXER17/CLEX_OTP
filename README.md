@@ -35,7 +35,8 @@ multi-user path in this build.
 /recent                           last 15
 /balance                          wallet balance
 /price SERVICE [COUNTRY]
-/operators [COUNTRY]              upstream providers; set DEFAULT_OPERATOR
+/op [N]                           show or switch the active operator id
+/operators [COUNTRY]              list upstream operator ids
 /countries
 /services [filter]                filter is a substring match
 /stats
